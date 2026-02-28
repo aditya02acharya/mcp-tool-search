@@ -1,0 +1,32 @@
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    volumes:
+      - ..:/workspace:cached
+    ports:
+      - "8080:8080"
+    environment:
+      - ENVIRONMENT=dev
+      - REDIS__HOST=redis
+      - REDIS__PORT=6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: sleep infinity
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-data:
