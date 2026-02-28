@@ -1,0 +1,17 @@
+server:
+  host: "0.0.0.0"
+
+redis:
+  host: "prod-cache.xxxxx.use1.cache.amazonaws.com"
+  port: 6379
+  db: 0
+  ssl: true
+
+embedding:
+  base_url: "http://embedding-service.prod.internal:8000"
+
+llm:
+  model_name: "gpt-4o"
+
+registry:
+  sync_interval_seconds: 300

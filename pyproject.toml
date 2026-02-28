@@ -1,0 +1,108 @@
+[tool.poetry]
+name = "mcp-tool-router"
+version = "0.1.0"
+description = "FastMCP server - smart proxy layer for tool registry with semantic search and context accumulation"
+authors = ["Developer"]
+license = "MIT"
+packages = [{ include = "mcp_tool_router", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastmcp = "^3.0"
+pydantic = "^2.7"
+pydantic-settings = "^2.4"
+redis = { version = "^5.2", extras = ["hiredis"] }
+httpx = "^0.28"
+litellm = "^1.55"
+sqlite-vec = "^0.1.6"
+numpy = "^2.1"
+pyyaml = "^6.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3"
+pytest-asyncio = "^0.24"
+pytest-cov = "^6.0"
+ruff = "^0.8"
+mypy = "^1.13"
+fakeredis = "^2.26"
+respx = "^0.22"
+types-pyyaml = "^6.0"
+types-redis = "^4.6"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+mcp-tool-router = "mcp_tool_router.server:main"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+    "S",    # flake8-bandit
+    "C4",   # flake8-comprehensions
+    "DTZ",  # flake8-datetimez
+    "T20",  # flake8-print
+    "PT",   # flake8-pytest-style
+    "PERF", # perflint
+]
+ignore = [
+    "S101",    # assert in tests
+    "PLR0913", # too many args
+    "PLR2004", # magic values
+    "S603",    # subprocess untrusted input
+    "S607",    # partial path
+    "RUF002",  # ambiguous unicode in docstrings
+    "RUF003",  # ambiguous unicode in comments
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S106", "S105"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+    "sqlite_vec.*",
+    "litellm.*",
+    "fakeredis.*",
+    "respx.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "--cov=mcp_tool_router --cov-report=term-missing --cov-fail-under=85"
+
+[tool.coverage.run]
+source = ["src/mcp_tool_router"]
+omit = ["src/mcp_tool_router/server.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.",
+]

@@ -1,0 +1,17 @@
+server:
+  host: "0.0.0.0"
+
+redis:
+  host: "stage-cache.xxxxx.use1.cache.amazonaws.com"
+  port: 6379
+  db: 0
+  ssl: true
+
+embedding:
+  base_url: "http://embedding-service.stage.internal:8000"
+
+llm:
+  model_name: "gpt-4o-mini"
+
+registry:
+  sync_interval_seconds: 120
