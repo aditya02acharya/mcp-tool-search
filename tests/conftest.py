@@ -14,7 +14,7 @@ from mcp_tool_router.context.compressor import ContextCompressor
 from mcp_tool_router.context.redis_store import RedisContextStore
 from mcp_tool_router.embeddings.client import EmbeddingClient
 from mcp_tool_router.index.store import ToolIndex
-from mcp_tool_router.models.schemas import ContextEntry, IndexedServer, IndexedTool, ServerRecord, ToolRecord
+from mcp_tool_router.models.schemas import ContextEntry, IndexedTool, ToolRecord
 from mcp_tool_router.settings import (
     AppSettings,
     EmbeddingSettings,
@@ -76,11 +76,10 @@ def registry_settings() -> RegistrySettings:
 @pytest.fixture
 def tdwa_settings() -> TDWASettings:
     return TDWASettings(
-        name_weight=0.10,
-        description_weight=0.30,
+        name_weight=0.15,
+        description_weight=0.35,
         params_weight=0.20,
         questions_weight=0.30,
-        server_description_weight=0.10,
         num_synthetic_questions=3,
     )
 
@@ -186,25 +185,4 @@ def make_indexed_tool(name: str, desc: str, tags: list[str] | None = None) -> In
         tags=tags or [],
         content_hash=f"hash-{name}",
         embedding=emb.tolist(),
-    )
-
-
-@pytest.fixture
-def sample_server_record() -> ServerRecord:
-    return ServerRecord(
-        server_id="srv-1",
-        server_name="weather-server",
-        alias="weather",
-        description="Weather data and forecast APIs",
-    )
-
-
-@pytest.fixture
-def sample_indexed_server() -> IndexedServer:
-    return IndexedServer(
-        server_id="srv-1",
-        server_name="weather-server",
-        alias="weather",
-        description="Weather data and forecast APIs",
-        content_hash="srv-hash-1",
     )

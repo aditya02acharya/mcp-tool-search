@@ -52,16 +52,10 @@ class EmbeddingClient:
         params_text: str,
         synthetic_questions: list[str],
         weights: TDWASettings,
-        server_description: str = "",
     ) -> np.ndarray:
         """Compute TDWA embedding for a tool document.
 
         z_TDWA = normalise( Σ wᵢ · Embed(cᵢ) )
-
-        When *server_description* is provided its weight is taken from
-        ``weights.server_description_weight``.  When absent the weight is
-        redistributed to the description component so the total always
-        sums to 1.
         """
         components = [name, description, params_text]
         w = np.array(
@@ -72,15 +66,9 @@ class EmbeddingClient:
         if synthetic_questions:
             components.append(" ".join(synthetic_questions))
             w = np.append(w, weights.questions_weight)
-
-        if server_description:
-            components.append(server_description)
-            w = np.append(w, weights.server_description_weight)
-
-        # Normalise weights so they sum to 1 (handles missing components)
-        w_sum = w.sum()
-        if w_sum > 0:
-            w = w / w_sum
+        else:
+            # Redistribute questions weight proportionally
+            w = w / w.sum()
 
         embeddings = await self.embed_documents(components)
         weighted: np.ndarray = np.einsum("i,ij->j", w, embeddings)

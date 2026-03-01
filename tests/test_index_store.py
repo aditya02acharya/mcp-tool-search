@@ -11,7 +11,7 @@ from mcp_tool_router.index.store import (
     _sanitise_fts,
     _serialize_f32,
 )
-from mcp_tool_router.models.schemas import IndexedServer, IndexedTool
+from mcp_tool_router.models.schemas import IndexedTool
 from tests.conftest import DIM, make_indexed_tool
 
 # ---------------------------------------------------------------------------
@@ -82,117 +82,6 @@ class TestContentHashes:
         await tool_index.upsert_tool(sample_indexed_tool)
         hashes = await tool_index.get_content_hashes()
         assert "get_weather" in hashes
-
-
-# ---------------------------------------------------------------------------
-# Server operations
-# ---------------------------------------------------------------------------
-
-
-class TestServerOperations:
-    async def test_upsert_and_get_server(self, tool_index: ToolIndex) -> None:
-        server = IndexedServer(
-            server_id="s1",
-            server_name="weather-mcp",
-            alias="weather",
-            description="Weather APIs",
-            content_hash="h1",
-        )
-        await tool_index.upsert_server(server)
-        result = await tool_index.get_server("s1")
-        assert result is not None
-        assert result.server_name == "weather-mcp"
-        assert result.description == "Weather APIs"
-
-    async def test_upsert_server_updates_existing(self, tool_index: ToolIndex) -> None:
-        server = IndexedServer(
-            server_id="s1", server_name="old", description="old desc", content_hash="h1"
-        )
-        await tool_index.upsert_server(server)
-        updated = IndexedServer(
-            server_id="s1", server_name="new", description="new desc", content_hash="h2"
-        )
-        await tool_index.upsert_server(updated)
-        result = await tool_index.get_server("s1")
-        assert result is not None
-        assert result.server_name == "new"
-        assert result.description == "new desc"
-
-    async def test_delete_servers(self, tool_index: ToolIndex) -> None:
-        server = IndexedServer(
-            server_id="s1", server_name="test", description="d", content_hash="h"
-        )
-        await tool_index.upsert_server(server)
-        await tool_index.delete_servers(["s1"])
-        assert await tool_index.get_server("s1") is None
-
-    async def test_get_server_hashes(self, tool_index: ToolIndex) -> None:
-        for i in range(3):
-            await tool_index.upsert_server(
-                IndexedServer(
-                    server_id=f"s{i}", server_name=f"srv{i}",
-                    description="d", content_hash=f"h{i}",
-                )
-            )
-        hashes = await tool_index.get_server_hashes()
-        assert len(hashes) == 3
-        assert hashes["s0"] == "h0"
-
-
-# ---------------------------------------------------------------------------
-# Tool with server metadata
-# ---------------------------------------------------------------------------
-
-
-class TestToolServerMetadata:
-    async def test_tool_stores_server_id(self, tool_index: ToolIndex) -> None:
-        tool = make_indexed_tool("weather_get_forecast", "Get forecast")
-        tool.server_id = "s1"
-        tool.server_description = "Weather APIs"
-        await tool_index.upsert_tool(tool)
-        result = await tool_index.get_tool("weather_get_forecast")
-        assert result is not None
-        assert result.server_id == "s1"
-        assert result.server_description == "Weather APIs"
-
-    async def test_search_includes_server_metadata(self, tool_index: ToolIndex) -> None:
-        # Insert a server
-        await tool_index.upsert_server(
-            IndexedServer(
-                server_id="s1", server_name="weather-mcp",
-                description="Weather data APIs", content_hash="h",
-            )
-        )
-        # Insert a tool linked to that server
-        tool = make_indexed_tool("weather_get_forecast", "Get weather forecast")
-        tool.server_id = "s1"
-        await tool_index.upsert_tool(tool)
-
-        query = np.zeros(DIM, dtype=np.float32)
-        results = await tool_index.hybrid_search(
-            query_text="weather forecast",
-            query_embedding=query,
-            top_k=5,
-            alpha=0.0,  # FTS only
-        )
-        assert len(results) >= 1
-        assert results[0].server_name == "weather-mcp"
-        assert results[0].server_description == "Weather data APIs"
-
-    async def test_search_without_server_returns_none(self, tool_index: ToolIndex) -> None:
-        tool = make_indexed_tool("standalone_tool", "Does stuff standalone")
-        await tool_index.upsert_tool(tool)
-
-        query = np.zeros(DIM, dtype=np.float32)
-        results = await tool_index.hybrid_search(
-            query_text="standalone",
-            query_embedding=query,
-            top_k=5,
-            alpha=0.0,
-        )
-        assert len(results) >= 1
-        assert results[0].server_name is None
-        assert results[0].server_description is None
 
 
 # ---------------------------------------------------------------------------

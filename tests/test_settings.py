@@ -73,10 +73,7 @@ class TestComponentDefaults:
 
     def test_tdwa_weights_sum(self) -> None:
         s = TDWASettings()
-        total = (
-            s.name_weight + s.description_weight + s.params_weight
-            + s.questions_weight + s.server_description_weight
-        )
+        total = s.name_weight + s.description_weight + s.params_weight + s.questions_weight
         assert abs(total - 1.0) < 1e-6
 
     def test_search_defaults(self) -> None:

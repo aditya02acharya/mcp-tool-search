@@ -137,11 +137,10 @@ class TDWASettings(BaseComponentSettings):
     _FIELD_PREFIX: ClassVar[str] = "tdwa"
     model_config = ConfigDict(alias_generator=_prefix_alias("tdwa"), populate_by_name=True)
 
-    name_weight: float = 0.10
-    description_weight: float = 0.30
+    name_weight: float = 0.15
+    description_weight: float = 0.35
     params_weight: float = 0.20
     questions_weight: float = 0.30
-    server_description_weight: float = 0.10
     num_synthetic_questions: int = 5
 
 

@@ -6,8 +6,6 @@ Change detection
 1. **Global hash** – SHA-256 of full sorted tool list → quick short-circuit.
 2. **Per-tool hash** – SHA-256 of ``(name, description, schema, tags)`` →
    identifies specific adds / removes / modifications for incremental update.
-3. **Server sync** – fetches MCP server metadata and links tools to their
-   parent servers for server-context-enriched embeddings.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ import litellm
 
 from mcp_tool_router.embeddings.client import EmbeddingClient
 from mcp_tool_router.index.store import ToolIndex
-from mcp_tool_router.models.schemas import IndexedServer, IndexedTool, ServerRecord, ToolRecord
+from mcp_tool_router.models.schemas import IndexedTool, ToolRecord
 from mcp_tool_router.registry.client import RegistryClient
 from mcp_tool_router.settings import LLMSettings, RegistrySettings, TDWASettings
 
@@ -48,7 +46,6 @@ class SyncWorker:
         self._llm = llm_settings
         self._last_global_hash: str | None = None
         self._running = False
-        self._server_lookup: dict[str, ServerRecord] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -72,9 +69,6 @@ class SyncWorker:
 
     async def sync_once(self) -> None:
         """Execute a single sync cycle."""
-        # Sync servers first so tool indexing can use server context
-        await self._sync_servers()
-
         tools = await self._registry.list_tools()
         global_hash = RegistryClient.compute_global_hash(tools)
 
@@ -108,55 +102,6 @@ class SyncWorker:
         self._last_global_hash = global_hash
 
     # ------------------------------------------------------------------
-    # Server sync
-    # ------------------------------------------------------------------
-
-    async def _sync_servers(self) -> None:
-        """Fetch MCP servers and upsert into the local index."""
-        try:
-            servers = await self._registry.list_servers()
-        except Exception:
-            logger.warning("Server list fetch failed – continuing with cached server data")
-            return
-
-        if not servers:
-            return
-
-        self._server_lookup = RegistryClient.build_server_lookup(servers)
-
-        remote_hashes = {s.server_id: s.content_hash() for s in servers}
-        local_hashes = await self._index.get_server_hashes()
-
-        added = set(remote_hashes) - set(local_hashes)
-        removed = set(local_hashes) - set(remote_hashes)
-        modified = {
-            sid
-            for sid in set(remote_hashes) & set(local_hashes)
-            if remote_hashes[sid] != local_hashes[sid]
-        }
-
-        if removed:
-            await self._index.delete_servers(list(removed))
-
-        servers_by_id = {s.server_id: s for s in servers}
-        for sid in added | modified:
-            server = servers_by_id[sid]
-            await self._index.upsert_server(
-                IndexedServer(
-                    server_id=server.server_id,
-                    server_name=server.server_name,
-                    alias=server.alias,
-                    description=server.description,
-                    content_hash=server.content_hash(),
-                )
-            )
-
-        if added or removed or modified:
-            logger.info(
-                "Server sync: +%d -%d ~%d", len(added), len(removed), len(modified)
-            )
-
-    # ------------------------------------------------------------------
     # Indexing a single tool
     # ------------------------------------------------------------------
 
@@ -164,18 +109,12 @@ class SyncWorker:
         questions = await self._generate_synthetic_questions(tool)
         params_text = json.dumps(tool.input_schema)
 
-        # Resolve parent server for context enrichment
-        server = RegistryClient.resolve_tool_server(tool.name, self._server_lookup)
-        server_description = server.description if server else ""
-        server_id = server.server_id if server else None
-
         embedding = await self._embeddings.embed_tool_tdwa(
             name=tool.name,
             description=tool.description,
             params_text=params_text,
             synthetic_questions=questions,
             weights=self._tdwa,
-            server_description=server_description,
         )
 
         await self._index.upsert_tool(
@@ -188,8 +127,6 @@ class SyncWorker:
                 content_hash=tool.content_hash(),
                 embedding=embedding.tolist(),
                 synthetic_questions=questions,
-                server_id=server_id,
-                server_description=server_description,
             )
         )
 
