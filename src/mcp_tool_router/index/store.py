@@ -20,6 +20,7 @@ import json
 import logging
 import sqlite3
 import struct
+import threading
 from typing import Any
 
 import numpy as np
@@ -56,6 +57,7 @@ class ToolIndex:
         self._settings = settings
         self._conn: sqlite3.Connection | None = None
         self._vec_available = False
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -90,7 +92,8 @@ class ToolIndex:
             except Exception:
                 logger.warning("sqlite-vec unavailable - using Python cosine fallback")
 
-        self._create_tables()
+        with self._lock:
+            self._create_tables()
 
     def _create_tables(self) -> None:
         assert self._conn is not None
@@ -145,6 +148,11 @@ class ToolIndex:
         assert self._conn is not None
         emb_blob = _serialize_f32(tool.embedding) if tool.embedding else None
 
+        with self._lock:
+            self._upsert_locked(tool, emb_blob)
+
+    def _upsert_locked(self, tool: IndexedTool, emb_blob: bytes | None) -> None:
+        assert self._conn is not None
         # Check if existing
         existing = self._conn.execute(
             "SELECT rowid FROM tools WHERE name = ?", (tool.name,)
@@ -240,6 +248,11 @@ class ToolIndex:
 
     def _delete_sync(self, names: list[str]) -> None:
         assert self._conn is not None
+        with self._lock:
+            self._delete_locked(names)
+
+    def _delete_locked(self, names: list[str]) -> None:
+        assert self._conn is not None
         for name in names:
             row = self._conn.execute("SELECT rowid FROM tools WHERE name = ?", (name,)).fetchone()
             if not row:
@@ -275,7 +288,8 @@ class ToolIndex:
 
     def _hashes_sync(self) -> dict[str, str]:
         assert self._conn is not None
-        rows = self._conn.execute("SELECT name, content_hash FROM tools").fetchall()
+        with self._lock:
+            rows = self._conn.execute("SELECT name, content_hash FROM tools").fetchall()
         return {r["name"]: r["content_hash"] for r in rows}
 
     async def get_tool(self, name: str) -> IndexedTool | None:
@@ -283,7 +297,8 @@ class ToolIndex:
 
     def _get_tool_sync(self, name: str) -> IndexedTool | None:
         assert self._conn is not None
-        row = self._conn.execute("SELECT * FROM tools WHERE name = ?", (name,)).fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM tools WHERE name = ?", (name,)).fetchone()
         if not row:
             return None
         return self._row_to_indexed_tool(row)
@@ -293,7 +308,8 @@ class ToolIndex:
 
     def _count_sync(self) -> int:
         assert self._conn is not None
-        row = self._conn.execute("SELECT COUNT(*) AS c FROM tools").fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS c FROM tools").fetchone()
         return int(row["c"]) if row else 0
 
     # ------------------------------------------------------------------
@@ -323,20 +339,21 @@ class ToolIndex:
         tags: list[str] | None,
         min_score: float,
     ) -> list[SearchResult]:
-        fetch_k = top_k * 3
-        vec_ranked = self._vector_search(query_embedding, fetch_k)
-        fts_ranked = self._fts_search(query_text, fetch_k)
-        combined = _rrf_combine(vec_ranked, fts_ranked, alpha=alpha)
+        with self._lock:
+            fetch_k = top_k * 3
+            vec_ranked = self._vector_search(query_embedding, fetch_k)
+            fts_ranked = self._fts_search(query_text, fetch_k)
+            combined = _rrf_combine(vec_ranked, fts_ranked, alpha=alpha)
 
-        # Tag filter
-        if tags:
-            tag_set = set(tags)
-            combined = [(n, s) for n, s in combined if self._tool_has_tags(n, tag_set)]
+            # Tag filter
+            if tags:
+                tag_set = set(tags)
+                combined = [(n, s) for n, s in combined if self._tool_has_tags(n, tag_set)]
 
-        # Min score filter + top-k
-        combined = [(n, s) for n, s in combined if s >= min_score][:top_k]
+            # Min score filter + top-k
+            combined = [(n, s) for n, s in combined if s >= min_score][:top_k]
 
-        return [self._to_search_result(n, s) for n, s in combined]
+            return [self._to_search_result(n, s) for n, s in combined]
 
     # ------------------------------------------------------------------
     # Vector search
