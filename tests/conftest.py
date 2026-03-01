@@ -102,7 +102,7 @@ async def tool_index(index_settings: IndexSettings) -> AsyncIterator[ToolIndex]:
     idx = ToolIndex(index_settings)
     await idx.initialize()
     yield idx
-    idx.close()
+    await idx.close()
 
 
 @pytest.fixture

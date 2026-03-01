@@ -70,7 +70,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
         await embeddings.close()
         await registry.close()
         await redis_store.close()
-        index.close()
+        await index.close()
 
 
 def create_server() -> FastMCP:
