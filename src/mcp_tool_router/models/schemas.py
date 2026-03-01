@@ -11,6 +11,40 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class ServerRecord(BaseModel):
+    """An MCP server fetched from the upstream registry."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    server_id: str
+    server_name: str
+    alias: str | None = None
+    description: str = ""
+
+    def content_hash(self) -> str:
+        payload = json.dumps(
+            {
+                "server_id": self.server_id,
+                "server_name": self.server_name,
+                "alias": self.alias,
+                "description": self.description,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+
+class IndexedServer(BaseModel):
+    """An MCP server that has been indexed locally with its embedding."""
+
+    server_id: str
+    server_name: str
+    alias: str | None = None
+    description: str = ""
+    content_hash: str = ""
+    embedding: list[float] | None = None
+
+
 class ToolRecord(BaseModel):
     """A tool fetched from the upstream registry."""
 
@@ -21,6 +55,7 @@ class ToolRecord(BaseModel):
     input_schema: dict[str, Any] = Field(alias="inputSchema", default_factory=dict)
     output_schema: dict[str, Any] | None = Field(alias="outputSchema", default=None)
     meta: dict[str, Any] | None = None
+    server_id: str | None = None
 
     @property
     def tags(self) -> list[str]:
@@ -58,6 +93,8 @@ class IndexedTool(BaseModel):
     content_hash: str = ""
     embedding: list[float] | None = None
     synthetic_questions: list[str] = Field(default_factory=list)
+    server_id: str | None = None
+    server_description: str = ""
 
 
 class SearchResult(BaseModel):
@@ -69,6 +106,8 @@ class SearchResult(BaseModel):
     output_schema: dict[str, Any] | None = None
     tags: list[str] = Field(default_factory=list)
     score: float = 0.0
+    server_name: str | None = None
+    server_description: str | None = None
 
 
 class ContextEntry(BaseModel):

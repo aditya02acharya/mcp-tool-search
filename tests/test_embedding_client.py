@@ -89,7 +89,7 @@ class TestEmbedDocuments:
 class TestTDWA:
     @respx.mock
     async def test_with_questions(self, client: EmbeddingClient, tdwa: TDWASettings) -> None:
-        # 4 components → 1 request (batch_size=2 → 2 requests)
+        # 4 components → batch_size=2 → 2 requests
         respx.post("http://test:8000/v1/embeddings").mock(
             side_effect=[
                 httpx.Response(200, json=_embedding_response(2)),
@@ -122,6 +122,51 @@ class TestTDWA:
             params_text="{}",
             synthetic_questions=[],
             weights=tdwa,
+        )
+        assert vec.shape == (DIM,)
+        assert abs(np.linalg.norm(vec) - 1.0) < 1e-5
+
+    @respx.mock
+    async def test_with_server_description(
+        self, client: EmbeddingClient, tdwa: TDWASettings
+    ) -> None:
+        # 5 components (name, desc, params, questions, server_desc) → 3 requests
+        respx.post("http://test:8000/v1/embeddings").mock(
+            side_effect=[
+                httpx.Response(200, json=_embedding_response(2)),
+                httpx.Response(200, json=_embedding_response(2)),
+                httpx.Response(200, json=_embedding_response(1)),
+            ]
+        )
+        vec = await client.embed_tool_tdwa(
+            name="tool",
+            description="does stuff",
+            params_text="{}",
+            synthetic_questions=["what?"],
+            weights=tdwa,
+            server_description="Weather data and forecast APIs",
+        )
+        assert vec.shape == (DIM,)
+        assert abs(np.linalg.norm(vec) - 1.0) < 1e-5
+
+    @respx.mock
+    async def test_without_server_description_redistributes(
+        self, client: EmbeddingClient, tdwa: TDWASettings
+    ) -> None:
+        # 4 components (no server_desc) → weights should still normalise to 1
+        respx.post("http://test:8000/v1/embeddings").mock(
+            side_effect=[
+                httpx.Response(200, json=_embedding_response(2)),
+                httpx.Response(200, json=_embedding_response(2)),
+            ]
+        )
+        vec = await client.embed_tool_tdwa(
+            name="tool",
+            description="does stuff",
+            params_text="{}",
+            synthetic_questions=["what?"],
+            weights=tdwa,
+            server_description="",
         )
         assert vec.shape == (DIM,)
         assert abs(np.linalg.norm(vec) - 1.0) < 1e-5
