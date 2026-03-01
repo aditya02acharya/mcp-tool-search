@@ -24,7 +24,7 @@ from typing import Any
 
 import numpy as np
 
-from mcp_tool_router.models.schemas import IndexedServer, IndexedTool, SearchResult
+from mcp_tool_router.models.schemas import IndexedTool, SearchResult
 from mcp_tool_router.settings import IndexSettings
 
 logger = logging.getLogger(__name__)
@@ -96,15 +96,6 @@ class ToolIndex:
         assert self._conn is not None
         self._conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS servers (
-                server_id       TEXT PRIMARY KEY,
-                server_name     TEXT NOT NULL,
-                alias           TEXT,
-                description     TEXT NOT NULL DEFAULT '',
-                content_hash    TEXT NOT NULL DEFAULT '',
-                embedding       BLOB
-            );
-
             CREATE TABLE IF NOT EXISTS tools (
                 name            TEXT PRIMARY KEY,
                 description     TEXT NOT NULL,
@@ -113,9 +104,7 @@ class ToolIndex:
                 tags            TEXT NOT NULL DEFAULT '[]',
                 content_hash    TEXT NOT NULL DEFAULT '',
                 synthetic_questions TEXT NOT NULL DEFAULT '[]',
-                embedding       BLOB,
-                server_id       TEXT,
-                server_description TEXT NOT NULL DEFAULT ''
+                embedding       BLOB
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS tools_fts USING fts5(
@@ -124,9 +113,6 @@ class ToolIndex:
             );
             """
         )
-        # Migrate existing tools tables that lack the new columns
-        self._migrate_tools_table()
-
         if self._vec_available:
             dim = self._settings.dimension
             self._conn.execute(
@@ -134,20 +120,6 @@ class ToolIndex:
                 f"USING vec0(embedding float[{dim}])"
             )
         self._conn.commit()
-
-    def _migrate_tools_table(self) -> None:
-        """Add server_id and server_description columns if missing (idempotent)."""
-        assert self._conn is not None
-        existing = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(tools)").fetchall()
-        }
-        if "server_id" not in existing:
-            self._conn.execute("ALTER TABLE tools ADD COLUMN server_id TEXT")
-        if "server_description" not in existing:
-            self._conn.execute(
-                "ALTER TABLE tools ADD COLUMN server_description TEXT NOT NULL DEFAULT ''"
-            )
 
     def close(self) -> None:
         if self._conn:
@@ -163,72 +135,7 @@ class ToolIndex:
         return self._vec_available
 
     # ------------------------------------------------------------------
-    # Server write operations
-    # ------------------------------------------------------------------
-
-    async def upsert_server(self, server: IndexedServer) -> None:
-        await asyncio.to_thread(self._upsert_server_sync, server)
-
-    def _upsert_server_sync(self, server: IndexedServer) -> None:
-        assert self._conn is not None
-        emb_blob = _serialize_f32(server.embedding) if server.embedding else None
-        self._conn.execute(
-            """INSERT INTO servers(server_id, server_name, alias, description,
-               content_hash, embedding)
-               VALUES(?,?,?,?,?,?)
-               ON CONFLICT(server_id) DO UPDATE SET
-               server_name=excluded.server_name, alias=excluded.alias,
-               description=excluded.description, content_hash=excluded.content_hash,
-               embedding=excluded.embedding""",
-            (
-                server.server_id,
-                server.server_name,
-                server.alias,
-                server.description,
-                server.content_hash,
-                emb_blob,
-            ),
-        )
-        self._conn.commit()
-
-    async def delete_servers(self, server_ids: list[str]) -> None:
-        await asyncio.to_thread(self._delete_servers_sync, server_ids)
-
-    def _delete_servers_sync(self, server_ids: list[str]) -> None:
-        assert self._conn is not None
-        for sid in server_ids:
-            self._conn.execute("DELETE FROM servers WHERE server_id = ?", (sid,))
-        self._conn.commit()
-
-    async def get_server_hashes(self) -> dict[str, str]:
-        return await asyncio.to_thread(self._server_hashes_sync)
-
-    def _server_hashes_sync(self) -> dict[str, str]:
-        assert self._conn is not None
-        rows = self._conn.execute("SELECT server_id, content_hash FROM servers").fetchall()
-        return {r["server_id"]: r["content_hash"] for r in rows}
-
-    async def get_server(self, server_id: str) -> IndexedServer | None:
-        return await asyncio.to_thread(self._get_server_sync, server_id)
-
-    def _get_server_sync(self, server_id: str) -> IndexedServer | None:
-        assert self._conn is not None
-        row = self._conn.execute(
-            "SELECT * FROM servers WHERE server_id = ?", (server_id,)
-        ).fetchone()
-        if not row:
-            return None
-        return IndexedServer(
-            server_id=row["server_id"],
-            server_name=row["server_name"],
-            alias=row["alias"],
-            description=row["description"],
-            content_hash=row["content_hash"],
-            embedding=_deserialize_f32(row["embedding"]).tolist() if row["embedding"] else None,
-        )
-
-    # ------------------------------------------------------------------
-    # Tool write operations
+    # Write operations
     # ------------------------------------------------------------------
 
     async def upsert_tool(self, tool: IndexedTool) -> None:
@@ -247,8 +154,7 @@ class ToolIndex:
             rowid = existing["rowid"]
             self._conn.execute(
                 """UPDATE tools SET description=?, input_schema=?, output_schema=?,
-                   tags=?, content_hash=?, synthetic_questions=?, embedding=?,
-                   server_id=?, server_description=?
+                   tags=?, content_hash=?, synthetic_questions=?, embedding=?
                    WHERE name=?""",
                 (
                     tool.description,
@@ -258,8 +164,6 @@ class ToolIndex:
                     tool.content_hash,
                     json.dumps(tool.synthetic_questions),
                     emb_blob,
-                    tool.server_id,
-                    tool.server_description,
                     tool.name,
                 ),
             )
@@ -296,9 +200,8 @@ class ToolIndex:
         else:
             cur = self._conn.execute(
                 """INSERT INTO tools(name, description, input_schema, output_schema,
-                   tags, content_hash, synthetic_questions, embedding,
-                   server_id, server_description)
-                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                   tags, content_hash, synthetic_questions, embedding)
+                   VALUES(?,?,?,?,?,?,?,?)""",
                 (
                     tool.name,
                     tool.description,
@@ -308,8 +211,6 @@ class ToolIndex:
                     tool.content_hash,
                     json.dumps(tool.synthetic_questions),
                     emb_blob,
-                    tool.server_id,
-                    tool.server_description,
                 ),
             )
             rowid = cur.lastrowid
@@ -531,11 +432,7 @@ class ToolIndex:
     def _to_search_result(self, name: str, score: float) -> SearchResult:
         assert self._conn is not None
         row = self._conn.execute(
-            """SELECT t.name, t.description, t.input_schema, t.output_schema, t.tags,
-                      s.server_name, s.description AS srv_description
-               FROM tools t
-               LEFT JOIN servers s ON t.server_id = s.server_id
-               WHERE t.name=?""",
+            "SELECT name, description, input_schema, output_schema, tags FROM tools WHERE name=?",
             (name,),
         ).fetchone()
         if not row:
@@ -547,8 +444,6 @@ class ToolIndex:
             output_schema=json.loads(row["output_schema"]) if row["output_schema"] else None,
             tags=json.loads(row["tags"]),
             score=score,
-            server_name=row["server_name"],
-            server_description=row["srv_description"] if row["srv_description"] else None,
         )
 
     @staticmethod
@@ -562,8 +457,6 @@ class ToolIndex:
             content_hash=row["content_hash"],
             embedding=_deserialize_f32(row["embedding"]).tolist() if row["embedding"] else None,
             synthetic_questions=json.loads(row["synthetic_questions"]),
-            server_id=row["server_id"],
-            server_description=row["server_description"] or "",
         )
 
 
