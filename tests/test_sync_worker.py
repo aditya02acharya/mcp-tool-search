@@ -11,7 +11,7 @@ import pytest
 
 from mcp_tool_router.embeddings.client import EmbeddingClient
 from mcp_tool_router.index.store import ToolIndex
-from mcp_tool_router.models.schemas import ToolRecord
+from mcp_tool_router.models.schemas import ServerRecord, ToolRecord
 from mcp_tool_router.registry.client import RegistryClient
 from mcp_tool_router.settings import (
     IndexSettings,
@@ -27,10 +27,19 @@ def _make_tool(name: str, desc: str = "d") -> ToolRecord:
     return ToolRecord(name=name, description=desc, input_schema={})
 
 
+def _make_server(
+    server_id: str, name: str, alias: str, desc: str = "server description"
+) -> ServerRecord:
+    return ServerRecord(
+        server_id=server_id, server_name=name, alias=alias, description=desc
+    )
+
+
 @pytest.fixture
 def registry() -> AsyncMock:
     r = AsyncMock(spec=RegistryClient)
     r.list_tools.return_value = []
+    r.list_servers.return_value = []
     return r
 
 
@@ -114,6 +123,70 @@ class TestSyncOnce:
         await worker.sync_once()
         # embed_tool_tdwa called only once (first sync)
         assert worker._embeddings.embed_tool_tdwa.call_count == 1  # type: ignore[union-attr]
+
+
+class TestServerSync:
+    async def test_syncs_servers(
+        self, worker: SyncWorker, registry: AsyncMock, index: ToolIndex
+    ) -> None:
+        registry.list_servers.return_value = [
+            _make_server("s1", "weather-mcp", "weather", "Weather APIs"),
+        ]
+        registry.list_tools.return_value = []
+        await worker.sync_once()
+        server = await index.get_server("s1")
+        assert server is not None
+        assert server.server_name == "weather-mcp"
+        assert server.description == "Weather APIs"
+
+    async def test_links_tool_to_server(
+        self, worker: SyncWorker, registry: AsyncMock, index: ToolIndex
+    ) -> None:
+        registry.list_servers.return_value = [
+            _make_server("s1", "weather-mcp", "weather", "Weather APIs"),
+        ]
+        registry.list_tools.return_value = [_make_tool("weather_get_forecast", "Get forecast")]
+        await worker.sync_once()
+
+        tool = await index.get_tool("weather_get_forecast")
+        assert tool is not None
+        assert tool.server_id == "s1"
+        assert tool.server_description == "Weather APIs"
+
+    async def test_tool_without_server_has_no_server_id(
+        self, worker: SyncWorker, registry: AsyncMock, index: ToolIndex
+    ) -> None:
+        registry.list_servers.return_value = [
+            _make_server("s1", "weather-mcp", "weather", "Weather APIs"),
+        ]
+        registry.list_tools.return_value = [_make_tool("standalone_tool", "Does stuff")]
+        await worker.sync_once()
+
+        tool = await index.get_tool("standalone_tool")
+        assert tool is not None
+        assert tool.server_id is None
+        assert tool.server_description == ""
+
+    async def test_passes_server_description_to_tdwa(
+        self, worker: SyncWorker, registry: AsyncMock, embeddings: AsyncMock
+    ) -> None:
+        registry.list_servers.return_value = [
+            _make_server("s1", "weather-mcp", "weather", "Weather APIs"),
+        ]
+        registry.list_tools.return_value = [_make_tool("weather_get_forecast")]
+        await worker.sync_once()
+
+        call_kwargs = embeddings.embed_tool_tdwa.call_args
+        assert call_kwargs.kwargs["server_description"] == "Weather APIs"
+
+    async def test_server_fetch_failure_continues(
+        self, worker: SyncWorker, registry: AsyncMock, index: ToolIndex
+    ) -> None:
+        """If server list fetch fails, tool sync should still proceed."""
+        registry.list_servers.side_effect = RuntimeError("network error")
+        registry.list_tools.return_value = [_make_tool("a")]
+        await worker.sync_once()
+        assert await index.tool_count() == 1
 
 
 class TestSyntheticQuestions:

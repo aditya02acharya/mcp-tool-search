@@ -15,10 +15,11 @@ index:
   similarity_chunk_size: 500
 
 tdwa:
-  name_weight: 0.15
-  description_weight: 0.35
+  name_weight: 0.10
+  description_weight: 0.30
   params_weight: 0.20
   questions_weight: 0.30
+  server_description_weight: 0.10
   num_synthetic_questions: 5
 
 search:
