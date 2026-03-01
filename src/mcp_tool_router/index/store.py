@@ -11,6 +11,8 @@ Key design choices
   questions for the keyword leg of hybrid search.
 * **Hybrid ranking** uses weighted Reciprocal Rank Fusion (RRF) so we never
   need to normalise heterogeneous score distributions.
+* **Connection pool** – a bounded pool of SQLite connections allows concurrent
+  reads under WAL mode.  Writes are serialised via a dedicated lock.
 """
 
 from __future__ import annotations
@@ -18,9 +20,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
 import sqlite3
 import struct
 import threading
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
@@ -46,6 +52,77 @@ def _deserialize_f32(blob: bytes) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Connection pool
+# ---------------------------------------------------------------------------
+
+
+class _ConnectionPool:
+    """Lazy, bounded pool of SQLite connections for concurrent WAL readers."""
+
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        max_size: int = 32,
+    ) -> None:
+        self._db_path = db_path
+        self._max_size = max_size
+        self._idle: queue.SimpleQueue[sqlite3.Connection] = queue.SimpleQueue()
+        self._created = 0
+        self._created_lock = threading.Lock()
+        self.vec_available = False
+
+    def _new_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        if self.vec_available:
+            try:
+                import sqlite_vec
+
+                conn.enable_load_extension(True)
+                sqlite_vec.load(conn)
+                conn.enable_load_extension(False)
+            except Exception:
+                logger.warning("Failed to load sqlite-vec on pooled connection")
+        return conn
+
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        """Check out a connection, return it when done."""
+        conn = self._acquire()
+        try:
+            yield conn
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            self._idle.put(conn)
+
+    def _acquire(self) -> sqlite3.Connection:
+        try:
+            return self._idle.get_nowait()
+        except queue.Empty:
+            with self._created_lock:
+                if self._created < self._max_size:
+                    self._created += 1
+                    return self._new_conn()
+            # Pool full – block until one is returned
+            return self._idle.get()
+
+    def close_all(self) -> None:
+        while True:
+            try:
+                self._idle.get_nowait().close()
+            except queue.Empty:
+                break
+
+
+# ---------------------------------------------------------------------------
 # ToolIndex
 # ---------------------------------------------------------------------------
 
@@ -55,9 +132,9 @@ class ToolIndex:
 
     def __init__(self, settings: IndexSettings) -> None:
         self._settings = settings
-        self._conn: sqlite3.Connection | None = None
-        self._vec_available = False
-        self._lock = threading.Lock()
+        self._pool: _ConnectionPool | None = None
+        self._write_lock = threading.Lock()
+        self._executor: ThreadPoolExecutor | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -71,33 +148,31 @@ class ToolIndex:
 
         pathlib.Path(self._settings.db_path).parent.mkdir(parents=True, exist_ok=True)
 
-        self._conn = sqlite3.connect(
+        self._pool = _ConnectionPool(
             self._settings.db_path,
-            check_same_thread=False,
+            max_size=self._settings.pool_size,
         )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
 
-        # Attempt to load sqlite-vec
-        if self._settings.use_vec_extension:
-            try:
-                import sqlite_vec
+        # Bootstrap: detect vec capability and create tables on the first connection
+        with self._pool.connection() as conn:
+            if self._settings.use_vec_extension:
+                try:
+                    import sqlite_vec
 
-                self._conn.enable_load_extension(True)
-                sqlite_vec.load(self._conn)
-                self._conn.enable_load_extension(False)
-                self._vec_available = True
-                logger.info("sqlite-vec extension loaded")
-            except Exception:
-                logger.warning("sqlite-vec unavailable - using Python cosine fallback")
+                    conn.enable_load_extension(True)
+                    sqlite_vec.load(conn)
+                    conn.enable_load_extension(False)
+                    self._pool.vec_available = True
+                    logger.info("sqlite-vec extension loaded")
+                except Exception:
+                    logger.warning("sqlite-vec unavailable - using Python cosine fallback")
 
-        with self._lock:
-            self._create_tables()
+            self._create_tables(conn)
 
-    def _create_tables(self) -> None:
-        assert self._conn is not None
-        self._conn.executescript(
+        self._executor = ThreadPoolExecutor(max_workers=self._settings.pool_size)
+
+    def _create_tables(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS tools (
                 name            TEXT PRIMARY KEY,
@@ -116,18 +191,21 @@ class ToolIndex:
             );
             """
         )
-        if self._vec_available:
+        if self.vec_available:
             dim = self._settings.dimension
-            self._conn.execute(
+            conn.execute(
                 f"CREATE VIRTUAL TABLE IF NOT EXISTS tools_vec "
                 f"USING vec0(embedding float[{dim}])"
             )
-        self._conn.commit()
+        conn.commit()
 
     def close(self) -> None:
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        if self._executor:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+        if self._pool:
+            self._pool.close_all()
+            self._pool = None
 
     @property
     def dimension(self) -> int:
@@ -135,181 +213,184 @@ class ToolIndex:
 
     @property
     def vec_available(self) -> bool:
-        return self._vec_available
+        return self._pool.vec_available if self._pool else False
+
+    # ------------------------------------------------------------------
+    # Thread dispatch helper
+    # ------------------------------------------------------------------
+
+    async def _in_thread(self, fn: Any, *args: Any) -> Any:
+        """Run *fn* on the dedicated thread-pool executor."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, fn, *args)
 
     # ------------------------------------------------------------------
     # Write operations
     # ------------------------------------------------------------------
 
     async def upsert_tool(self, tool: IndexedTool) -> None:
-        await asyncio.to_thread(self._upsert_sync, tool)
+        await self._in_thread(self._upsert_sync, tool)
 
     def _upsert_sync(self, tool: IndexedTool) -> None:
-        assert self._conn is not None
+        assert self._pool is not None
         emb_blob = _serialize_f32(tool.embedding) if tool.embedding else None
 
-        with self._lock:
-            self._upsert_locked(tool, emb_blob)
-
-    def _upsert_locked(self, tool: IndexedTool, emb_blob: bytes | None) -> None:
-        assert self._conn is not None
-        # Check if existing
-        existing = self._conn.execute(
-            "SELECT rowid FROM tools WHERE name = ?", (tool.name,)
-        ).fetchone()
-
-        if existing:
-            rowid = existing["rowid"]
-            self._conn.execute(
-                """UPDATE tools SET description=?, input_schema=?, output_schema=?,
-                   tags=?, content_hash=?, synthetic_questions=?, embedding=?
-                   WHERE name=?""",
-                (
-                    tool.description,
-                    json.dumps(tool.input_schema),
-                    json.dumps(tool.output_schema) if tool.output_schema else None,
-                    json.dumps(tool.tags),
-                    tool.content_hash,
-                    json.dumps(tool.synthetic_questions),
-                    emb_blob,
-                    tool.name,
-                ),
-            )
-            # Update FTS
-            self._conn.execute(
-                "INSERT INTO tools_fts(tools_fts, rowid, name, description, tags, "
-                "synthetic_questions) VALUES('delete', ?, ?, ?, ?, ?)",
-                (
-                    rowid,
-                    tool.name,
-                    tool.description,
-                    " ".join(tool.tags),
-                    " ".join(tool.synthetic_questions),
-                ),
-            )
-            self._conn.execute(
-                "INSERT INTO tools_fts(rowid, name, description, tags, synthetic_questions) "
-                "VALUES(?, ?, ?, ?, ?)",
-                (
-                    rowid,
-                    tool.name,
-                    tool.description,
-                    " ".join(tool.tags),
-                    " ".join(tool.synthetic_questions),
-                ),
-            )
-            # Update vec
-            if self._vec_available and emb_blob:
-                self._conn.execute("DELETE FROM tools_vec WHERE rowid = ?", (rowid,))
-                self._conn.execute(
-                    "INSERT INTO tools_vec(rowid, embedding) VALUES(?, ?)",
-                    (rowid, emb_blob),
-                )
-        else:
-            cur = self._conn.execute(
-                """INSERT INTO tools(name, description, input_schema, output_schema,
-                   tags, content_hash, synthetic_questions, embedding)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (
-                    tool.name,
-                    tool.description,
-                    json.dumps(tool.input_schema),
-                    json.dumps(tool.output_schema) if tool.output_schema else None,
-                    json.dumps(tool.tags),
-                    tool.content_hash,
-                    json.dumps(tool.synthetic_questions),
-                    emb_blob,
-                ),
-            )
-            rowid = cur.lastrowid
-            # FTS
-            self._conn.execute(
-                "INSERT INTO tools_fts(rowid, name, description, tags, synthetic_questions) "
-                "VALUES(?, ?, ?, ?, ?)",
-                (
-                    rowid,
-                    tool.name,
-                    tool.description,
-                    " ".join(tool.tags),
-                    " ".join(tool.synthetic_questions),
-                ),
-            )
-            # Vec
-            if self._vec_available and emb_blob:
-                self._conn.execute(
-                    "INSERT INTO tools_vec(rowid, embedding) VALUES(?, ?)",
-                    (rowid, emb_blob),
-                )
-
-        self._conn.commit()
-
-    async def delete_tools(self, names: list[str]) -> None:
-        await asyncio.to_thread(self._delete_sync, names)
-
-    def _delete_sync(self, names: list[str]) -> None:
-        assert self._conn is not None
-        with self._lock:
-            self._delete_locked(names)
-
-    def _delete_locked(self, names: list[str]) -> None:
-        assert self._conn is not None
-        for name in names:
-            row = self._conn.execute("SELECT rowid FROM tools WHERE name = ?", (name,)).fetchone()
-            if not row:
-                continue
-            rowid = row["rowid"]
-            existing = self._conn.execute(
-                "SELECT name, description, tags, synthetic_questions FROM tools WHERE rowid=?",
-                (rowid,),
+        with self._write_lock, self._pool.connection() as conn:
+            # Check if existing
+            existing = conn.execute(
+                "SELECT rowid FROM tools WHERE name = ?", (tool.name,)
             ).fetchone()
+
             if existing:
-                self._conn.execute(
+                rowid = existing["rowid"]
+                conn.execute(
+                    """UPDATE tools SET description=?, input_schema=?, output_schema=?,
+                       tags=?, content_hash=?, synthetic_questions=?, embedding=?
+                       WHERE name=?""",
+                    (
+                        tool.description,
+                        json.dumps(tool.input_schema),
+                        json.dumps(tool.output_schema) if tool.output_schema else None,
+                        json.dumps(tool.tags),
+                        tool.content_hash,
+                        json.dumps(tool.synthetic_questions),
+                        emb_blob,
+                        tool.name,
+                    ),
+                )
+                # Update FTS
+                conn.execute(
                     "INSERT INTO tools_fts(tools_fts, rowid, name, description, tags, "
                     "synthetic_questions) VALUES('delete', ?, ?, ?, ?, ?)",
                     (
                         rowid,
-                        existing["name"],
-                        existing["description"],
-                        existing["tags"],
-                        existing["synthetic_questions"],
+                        tool.name,
+                        tool.description,
+                        " ".join(tool.tags),
+                        " ".join(tool.synthetic_questions),
                     ),
                 )
-            if self._vec_available:
-                self._conn.execute("DELETE FROM tools_vec WHERE rowid = ?", (rowid,))
-            self._conn.execute("DELETE FROM tools WHERE name = ?", (name,))
-        self._conn.commit()
+                conn.execute(
+                    "INSERT INTO tools_fts(rowid, name, description, tags, synthetic_questions) "
+                    "VALUES(?, ?, ?, ?, ?)",
+                    (
+                        rowid,
+                        tool.name,
+                        tool.description,
+                        " ".join(tool.tags),
+                        " ".join(tool.synthetic_questions),
+                    ),
+                )
+                # Update vec
+                if self.vec_available and emb_blob:
+                    conn.execute("DELETE FROM tools_vec WHERE rowid = ?", (rowid,))
+                    conn.execute(
+                        "INSERT INTO tools_vec(rowid, embedding) VALUES(?, ?)",
+                        (rowid, emb_blob),
+                    )
+            else:
+                cur = conn.execute(
+                    """INSERT INTO tools(name, description, input_schema, output_schema,
+                       tags, content_hash, synthetic_questions, embedding)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (
+                        tool.name,
+                        tool.description,
+                        json.dumps(tool.input_schema),
+                        json.dumps(tool.output_schema) if tool.output_schema else None,
+                        json.dumps(tool.tags),
+                        tool.content_hash,
+                        json.dumps(tool.synthetic_questions),
+                        emb_blob,
+                    ),
+                )
+                rowid = cur.lastrowid
+                # FTS
+                conn.execute(
+                    "INSERT INTO tools_fts(rowid, name, description, tags, synthetic_questions) "
+                    "VALUES(?, ?, ?, ?, ?)",
+                    (
+                        rowid,
+                        tool.name,
+                        tool.description,
+                        " ".join(tool.tags),
+                        " ".join(tool.synthetic_questions),
+                    ),
+                )
+                # Vec
+                if self.vec_available and emb_blob:
+                    conn.execute(
+                        "INSERT INTO tools_vec(rowid, embedding) VALUES(?, ?)",
+                        (rowid, emb_blob),
+                    )
+
+            conn.commit()
+
+    async def delete_tools(self, names: list[str]) -> None:
+        await self._in_thread(self._delete_sync, names)
+
+    def _delete_sync(self, names: list[str]) -> None:
+        assert self._pool is not None
+        with self._write_lock, self._pool.connection() as conn:
+            for name in names:
+                row = conn.execute(
+                    "SELECT rowid FROM tools WHERE name = ?", (name,)
+                ).fetchone()
+                if not row:
+                    continue
+                rowid = row["rowid"]
+                existing = conn.execute(
+                    "SELECT name, description, tags, synthetic_questions FROM tools WHERE rowid=?",
+                    (rowid,),
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        "INSERT INTO tools_fts(tools_fts, rowid, name, description, tags, "
+                        "synthetic_questions) VALUES('delete', ?, ?, ?, ?, ?)",
+                        (
+                            rowid,
+                            existing["name"],
+                            existing["description"],
+                            existing["tags"],
+                            existing["synthetic_questions"],
+                        ),
+                    )
+                if self.vec_available:
+                    conn.execute("DELETE FROM tools_vec WHERE rowid = ?", (rowid,))
+                conn.execute("DELETE FROM tools WHERE name = ?", (name,))
+            conn.commit()
 
     # ------------------------------------------------------------------
     # Read operations
     # ------------------------------------------------------------------
 
     async def get_content_hashes(self) -> dict[str, str]:
-        return await asyncio.to_thread(self._hashes_sync)
+        return await self._in_thread(self._hashes_sync)
 
     def _hashes_sync(self) -> dict[str, str]:
-        assert self._conn is not None
-        with self._lock:
-            rows = self._conn.execute("SELECT name, content_hash FROM tools").fetchall()
+        assert self._pool is not None
+        with self._pool.connection() as conn:
+            rows = conn.execute("SELECT name, content_hash FROM tools").fetchall()
         return {r["name"]: r["content_hash"] for r in rows}
 
     async def get_tool(self, name: str) -> IndexedTool | None:
-        return await asyncio.to_thread(self._get_tool_sync, name)
+        return await self._in_thread(self._get_tool_sync, name)
 
     def _get_tool_sync(self, name: str) -> IndexedTool | None:
-        assert self._conn is not None
-        with self._lock:
-            row = self._conn.execute("SELECT * FROM tools WHERE name = ?", (name,)).fetchone()
+        assert self._pool is not None
+        with self._pool.connection() as conn:
+            row = conn.execute("SELECT * FROM tools WHERE name = ?", (name,)).fetchone()
         if not row:
             return None
         return self._row_to_indexed_tool(row)
 
     async def tool_count(self) -> int:
-        return await asyncio.to_thread(self._count_sync)
+        return await self._in_thread(self._count_sync)
 
     def _count_sync(self) -> int:
-        assert self._conn is not None
-        with self._lock:
-            row = self._conn.execute("SELECT COUNT(*) AS c FROM tools").fetchone()
+        assert self._pool is not None
+        with self._pool.connection() as conn:
+            row = conn.execute("SELECT COUNT(*) AS c FROM tools").fetchone()
         return int(row["c"]) if row else 0
 
     # ------------------------------------------------------------------
@@ -326,7 +407,7 @@ class ToolIndex:
         tags: list[str] | None = None,
         min_score: float = 0.0,
     ) -> list[SearchResult]:
-        return await asyncio.to_thread(
+        return await self._in_thread(
             self._hybrid_sync, query_text, query_embedding, top_k, alpha, tags, min_score
         )
 
@@ -339,36 +420,40 @@ class ToolIndex:
         tags: list[str] | None,
         min_score: float,
     ) -> list[SearchResult]:
-        with self._lock:
+        assert self._pool is not None
+        with self._pool.connection() as conn:
             fetch_k = top_k * 3
-            vec_ranked = self._vector_search(query_embedding, fetch_k)
-            fts_ranked = self._fts_search(query_text, fetch_k)
+            vec_ranked = self._vector_search(conn, query_embedding, fetch_k)
+            fts_ranked = self._fts_search(conn, query_text, fetch_k)
             combined = _rrf_combine(vec_ranked, fts_ranked, alpha=alpha)
 
             # Tag filter
             if tags:
                 tag_set = set(tags)
-                combined = [(n, s) for n, s in combined if self._tool_has_tags(n, tag_set)]
+                combined = [(n, s) for n, s in combined if self._tool_has_tags(conn, n, tag_set)]
 
             # Min score filter + top-k
             combined = [(n, s) for n, s in combined if s >= min_score][:top_k]
 
-            return [self._to_search_result(n, s) for n, s in combined]
+            return [self._to_search_result(conn, n, s) for n, s in combined]
 
     # ------------------------------------------------------------------
     # Vector search
     # ------------------------------------------------------------------
 
-    def _vector_search(self, query_embedding: np.ndarray, top_k: int) -> list[tuple[str, float]]:
-        if self._vec_available:
-            return self._vec_ext_search(query_embedding, top_k)
-        return self._python_cosine_search(query_embedding, top_k)
+    def _vector_search(
+        self, conn: sqlite3.Connection, query_embedding: np.ndarray, top_k: int
+    ) -> list[tuple[str, float]]:
+        if self.vec_available:
+            return self._vec_ext_search(conn, query_embedding, top_k)
+        return self._python_cosine_search(conn, query_embedding, top_k)
 
-    def _vec_ext_search(self, query_embedding: np.ndarray, top_k: int) -> list[tuple[str, float]]:
+    def _vec_ext_search(
+        self, conn: sqlite3.Connection, query_embedding: np.ndarray, top_k: int
+    ) -> list[tuple[str, float]]:
         """KNN via sqlite-vec ``vec0`` virtual table."""
-        assert self._conn is not None
         blob = _serialize_f32(query_embedding)
-        rows = self._conn.execute(
+        rows = conn.execute(
             """SELECT v.rowid, v.distance, t.name
                FROM tools_vec v
                JOIN tools t ON t.rowid = v.rowid
@@ -380,10 +465,9 @@ class ToolIndex:
         return [(r["name"], max(0.0, 1.0 - r["distance"] / 2.0)) for r in rows]
 
     def _python_cosine_search(
-        self, query_embedding: np.ndarray, top_k: int
+        self, conn: sqlite3.Connection, query_embedding: np.ndarray, top_k: int
     ) -> list[tuple[str, float]]:
         """Chunked NumPy cosine similarity – CPU / memory friendly."""
-        assert self._conn is not None
         chunk = self._settings.similarity_chunk_size
         q_norm = np.linalg.norm(query_embedding)
         q_unit = query_embedding / q_norm if q_norm > 0 else query_embedding
@@ -392,8 +476,9 @@ class ToolIndex:
         offset = 0
 
         while True:
-            rows = self._conn.execute(
-                "SELECT name, embedding FROM tools WHERE embedding IS NOT NULL " "LIMIT ? OFFSET ?",
+            rows = conn.execute(
+                "SELECT name, embedding FROM tools WHERE embedding IS NOT NULL "
+                "LIMIT ? OFFSET ?",
                 (chunk, offset),
             ).fetchall()
             if not rows:
@@ -415,13 +500,14 @@ class ToolIndex:
     # FTS5 search
     # ------------------------------------------------------------------
 
-    def _fts_search(self, query: str, top_k: int) -> list[tuple[str, float]]:
-        assert self._conn is not None
+    def _fts_search(
+        self, conn: sqlite3.Connection, query: str, top_k: int
+    ) -> list[tuple[str, float]]:
         safe_query = _sanitise_fts(query)
         if not safe_query:
             return []
         try:
-            rows = self._conn.execute(
+            rows = conn.execute(
                 """SELECT t.name, -tools_fts.rank AS score
                    FROM tools_fts
                    JOIN tools t ON t.rowid = tools_fts.rowid
@@ -438,17 +524,15 @@ class ToolIndex:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _tool_has_tags(self, name: str, tag_set: set[str]) -> bool:
-        assert self._conn is not None
-        row = self._conn.execute("SELECT tags FROM tools WHERE name = ?", (name,)).fetchone()
+    def _tool_has_tags(self, conn: sqlite3.Connection, name: str, tag_set: set[str]) -> bool:
+        row = conn.execute("SELECT tags FROM tools WHERE name = ?", (name,)).fetchone()
         if not row:
             return False
         tool_tags: list[str] = json.loads(row["tags"])
         return bool(tag_set & set(tool_tags))
 
-    def _to_search_result(self, name: str, score: float) -> SearchResult:
-        assert self._conn is not None
-        row = self._conn.execute(
+    def _to_search_result(self, conn: sqlite3.Connection, name: str, score: float) -> SearchResult:
+        row = conn.execute(
             "SELECT name, description, input_schema, output_schema, tags FROM tools WHERE name=?",
             (name,),
         ).fetchone()
