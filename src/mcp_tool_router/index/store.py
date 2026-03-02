@@ -11,7 +11,7 @@ Key design choices
   questions for the keyword leg of hybrid search.
 * **Hybrid ranking** uses weighted Reciprocal Rank Fusion (RRF) so we never
   need to normalise heterogeneous score distributions.
-* **aiosqlite + aiosqlitepool** – native async SQLite access with a bounded
+* **aiosqlite** – native async SQLite access with a lightweight bounded
   connection pool.  Writes are serialised via an ``asyncio.Lock``.
 """
 
@@ -22,11 +22,12 @@ import json
 import logging
 import sqlite3
 import struct
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 import aiosqlite
 import numpy as np
-from aiosqlitepool import SQLiteConnectionPool
 
 from mcp_tool_router.models.schemas import IndexedTool, SearchResult
 from mcp_tool_router.settings import IndexSettings
@@ -49,6 +50,64 @@ def _deserialize_f32(blob: bytes) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Async connection pool
+# ---------------------------------------------------------------------------
+
+
+class _AsyncConnectionPool:
+    """Bounded pool of aiosqlite connections for concurrent WAL readers."""
+
+    def __init__(
+        self,
+        factory: Callable[[], Awaitable[aiosqlite.Connection]],
+        max_size: int = 5,
+    ) -> None:
+        self._factory = factory
+        self._max_size = max_size
+        self._idle: asyncio.Queue[aiosqlite.Connection] = asyncio.Queue(maxsize=max_size)
+        self._created = 0
+        self._lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Check out a connection, return it when done."""
+        conn = await self._acquire()
+        try:
+            yield conn
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            self._idle.put_nowait(conn)
+
+    async def _acquire(self) -> aiosqlite.Connection:
+        # Try to grab an idle connection
+        try:
+            return self._idle.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        # Create a new one if capacity allows
+        async with self._lock:
+            if self._created < self._max_size:
+                self._created += 1
+                return await self._factory()
+        # Pool full – block until one is returned
+        return await self._idle.get()
+
+    async def close(self) -> None:
+        """Close all idle connections."""
+        while True:
+            try:
+                conn = self._idle.get_nowait()
+                await conn.close()
+            except asyncio.QueueEmpty:
+                break
+
+
+# ---------------------------------------------------------------------------
 # ToolIndex
 # ---------------------------------------------------------------------------
 
@@ -58,7 +117,7 @@ class ToolIndex:
 
     def __init__(self, settings: IndexSettings) -> None:
         self._settings = settings
-        self._pool: SQLiteConnectionPool | None = None
+        self._pool: _AsyncConnectionPool | None = None
         self._write_lock = asyncio.Lock()
         self._vec_available = False
 
@@ -106,9 +165,9 @@ class ToolIndex:
                     logger.warning("Failed to load sqlite-vec on pooled connection")
             return conn
 
-        self._pool = SQLiteConnectionPool(
-            connection_factory=_factory,
-            pool_size=self._settings.pool_size,
+        self._pool = _AsyncConnectionPool(
+            factory=_factory,
+            max_size=self._settings.pool_size,
         )
 
         # Create tables on the first connection

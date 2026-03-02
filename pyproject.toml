@@ -16,7 +16,6 @@ httpx = "^0.28"
 litellm = "^1.55"
 sqlite-vec = "^0.1.6"
 aiosqlite = "^0.22"
-aiosqlitepool = "^1.0"
 numpy = "^2.1"
 pyyaml = "^6.0"
 
@@ -88,7 +87,6 @@ plugins = ["pydantic.mypy"]
 module = [
     "sqlite_vec.*",
     "aiosqlite.*",
-    "aiosqlitepool.*",
     "litellm.*",
     "fakeredis.*",
     "respx.*",
