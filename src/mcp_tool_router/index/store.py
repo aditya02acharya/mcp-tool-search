@@ -9,8 +9,8 @@ Key design choices
   to cap memory on resource-constrained pods.
 * **FTS5** – full-text search on name / description / tags / synthetic
   questions for the keyword leg of hybrid search.
-* **Hybrid ranking** uses weighted Reciprocal Rank Fusion (RRF) so we never
-  need to normalise heterogeneous score distributions.
+* **Hybrid ranking** uses weighted linear interpolation of max-normalised
+  vector and FTS5 scores, producing final scores in [0, 1].
 * **aiosqlite** – native async SQLite access with a lightweight bounded
   connection pool.  Writes are serialised via an ``asyncio.Lock``.
 """
@@ -393,7 +393,7 @@ class ToolIndex:
             fetch_k = top_k * 3
             vec_ranked = await self._vector_search(conn, query_embedding, fetch_k)
             fts_ranked = await self._fts_search(conn, query_text, fetch_k)
-            combined = _rrf_combine(vec_ranked, fts_ranked, alpha=alpha)
+            combined = _weighted_combine(vec_ranked, fts_ranked, alpha=alpha)
 
             # Tag filter
             if tags:
@@ -550,20 +550,38 @@ class ToolIndex:
 # ---------------------------------------------------------------------------
 
 
-def _rrf_combine(
+def _normalise_scores(
+    results: list[tuple[str, float]],
+) -> list[tuple[str, float]]:
+    """Normalise scores to [0, 1] by dividing by the maximum."""
+    if not results:
+        return results
+    max_score = max(s for _, s in results)
+    if max_score <= 0:
+        return results
+    return [(n, s / max_score) for n, s in results]
+
+
+def _weighted_combine(
     vec_results: list[tuple[str, float]],
     fts_results: list[tuple[str, float]],
     *,
-    k: int = 60,
     alpha: float = 0.7,
 ) -> list[tuple[str, float]]:
-    """Weighted Reciprocal Rank Fusion."""
-    scores: dict[str, float] = {}
-    for rank, (name, _) in enumerate(vec_results):
-        scores[name] = scores.get(name, 0.0) + alpha / (k + rank + 1)
-    for rank, (name, _) in enumerate(fts_results):
-        scores[name] = scores.get(name, 0.0) + (1.0 - alpha) / (k + rank + 1)
-    return sorted(scores.items(), key=lambda t: t[1], reverse=True)
+    """Weighted linear interpolation of normalised score lists.
+
+    Both inputs are max-normalised to [0, 1] before blending so that
+    ``alpha * vec_score + (1 - alpha) * fts_score`` produces a final
+    score in [0, 1].
+    """
+    vec_norm = dict(_normalise_scores(vec_results))
+    fts_norm = dict(_normalise_scores(fts_results))
+    all_names = set(vec_norm) | set(fts_norm)
+    combined = [
+        (name, alpha * vec_norm.get(name, 0.0) + (1 - alpha) * fts_norm.get(name, 0.0))
+        for name in all_names
+    ]
+    return sorted(combined, key=lambda t: t[1], reverse=True)
 
 
 def _sanitise_fts(query: str) -> str:
