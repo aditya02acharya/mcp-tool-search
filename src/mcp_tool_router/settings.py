@@ -154,6 +154,19 @@ class SearchSettings(BaseComponentSettings):
     hybrid_alpha: float = 0.7  # vector vs FTS weight
 
 
+class MCPClientSettings(BaseComponentSettings):
+    """Settings for the MCP client factory that connects to remote MCP servers."""
+
+    _FIELD_PREFIX: ClassVar[str] = "mcp_client"
+    model_config = ConfigDict(alias_generator=_prefix_alias("mcp_client"), populate_by_name=True)
+
+    server_list_url: str = "/mcp/server"
+    connect_timeout_seconds: float = 30.0
+    call_timeout_seconds: float = 60.0
+    credential_ttl_seconds: int = 3600
+    aws_region: str = "us-east-1"
+
+
 class ServerSettings(BaseComponentSettings):
     _FIELD_PREFIX: ClassVar[str] = "server"
     model_config = ConfigDict(alias_generator=_prefix_alias("server"), populate_by_name=True)
@@ -187,6 +200,7 @@ class AppSettings(BaseSettings):
     registry: RegistrySettings = Field(default_factory=RegistrySettings)
     tdwa: TDWASettings = Field(default_factory=TDWASettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
+    mcp_client: MCPClientSettings = Field(default_factory=MCPClientSettings)
 
     @classmethod
     def settings_customise_sources(

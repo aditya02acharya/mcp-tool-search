@@ -101,3 +101,42 @@ class ContextSummary(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
     total_entries: int = 0
     total_size_bytes: int = 0
+
+
+# ---------------------------------------------------------------------------
+# MCP server registry models
+# ---------------------------------------------------------------------------
+
+
+class MCPServerCredentials(BaseModel):
+    """Credential reference for an MCP server."""
+
+    auth_value: str = ""
+
+
+class MCPServerRecord(BaseModel):
+    """An MCP server descriptor returned by the registry ``GET /mcp/server``."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    server_id: str
+    server_name: str
+    description: str = ""
+    transport: str = "streamable_http"
+    auth_type: str | None = None
+    credentials: MCPServerCredentials | None = None
+    url: str
+    env: list[str] = Field(default_factory=list)
+    static_headers: dict[str, str] = Field(default_factory=dict)
+
+    @property
+    def has_remote_secret(self) -> bool:
+        """True when the secret is stored in AWS Secrets Manager."""
+        return "secret_url" in self.env and "role_name" in self.env
+
+    @property
+    def rotation_frequency_days(self) -> int | None:
+        """Return rotation frequency if declared, else None."""
+        if "rotation_frequency_days" not in self.env:
+            return None
+        return None  # actual value comes from the remote config
