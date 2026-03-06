@@ -7,9 +7,10 @@ import numpy as np
 from mcp_tool_router.index.store import (
     ToolIndex,
     _deserialize_f32,
-    _rrf_combine,
+    _normalise_scores,
     _sanitise_fts,
     _serialize_f32,
+    _weighted_combine,
 )
 from mcp_tool_router.models.schemas import IndexedTool
 from tests.conftest import DIM, make_indexed_tool
@@ -169,21 +170,43 @@ class TestHybridSearch:
 
 
 # ---------------------------------------------------------------------------
-# RRF + FTS sanitisation
+# Score normalisation + weighted combination
 # ---------------------------------------------------------------------------
 
 
-class TestRRF:
+class TestNormaliseScores:
+    def test_normalises_to_unit(self) -> None:
+        results = [("a", 10.0), ("b", 5.0), ("c", 2.0)]
+        normed = _normalise_scores(results)
+        assert normed[0] == ("a", 1.0)
+        assert normed[1] == ("b", 0.5)
+        assert normed[2] == ("c", 0.2)
+
+    def test_empty(self) -> None:
+        assert _normalise_scores([]) == []
+
+    def test_all_zero(self) -> None:
+        assert _normalise_scores([("a", 0.0)]) == [("a", 0.0)]
+
+
+class TestWeightedCombine:
     def test_combines_scores(self) -> None:
         vec = [("a", 0.9), ("b", 0.5)]
         fts = [("b", 10.0), ("c", 5.0)]
-        combined = _rrf_combine(vec, fts, alpha=0.5)
+        combined = _weighted_combine(vec, fts, alpha=0.5)
         names = [n for n, _ in combined]
         # 'b' appears in both → should rank high
-        assert "b" in names
+        assert names[0] == "b"
+
+    def test_scores_in_unit_range(self) -> None:
+        vec = [("a", 0.9), ("b", 0.1)]
+        fts = [("b", 50.0), ("c", 25.0)]
+        combined = _weighted_combine(vec, fts, alpha=0.7)
+        for _, score in combined:
+            assert 0.0 <= score <= 1.0
 
     def test_empty_inputs(self) -> None:
-        assert _rrf_combine([], []) == []
+        assert _weighted_combine([], []) == []
 
 
 class TestSanitiseFTS:

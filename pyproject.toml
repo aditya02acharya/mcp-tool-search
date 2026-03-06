@@ -15,6 +15,7 @@ redis = { version = "^5.2", extras = ["hiredis"] }
 httpx = "^0.28"
 litellm = "^1.55"
 sqlite-vec = "^0.1.6"
+aiosqlite = "^0.22"
 numpy = "^2.1"
 pyyaml = "^6.0"
 
@@ -85,6 +86,7 @@ plugins = ["pydantic.mypy"]
 [[tool.mypy.overrides]]
 module = [
     "sqlite_vec.*",
+    "aiosqlite.*",
     "litellm.*",
     "fakeredis.*",
     "respx.*",

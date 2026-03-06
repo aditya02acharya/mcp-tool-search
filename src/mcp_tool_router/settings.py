@@ -108,6 +108,7 @@ class IndexSettings(BaseComponentSettings):
     use_vec_extension: bool = True
     similarity_chunk_size: int = 500
     dimension: int = 4096
+    pool_size: int = 32
 
 
 class LLMSettings(BaseComponentSettings):
