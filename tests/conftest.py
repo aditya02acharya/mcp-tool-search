@@ -20,6 +20,7 @@ from mcp_tool_router.settings import (
     EmbeddingSettings,
     IndexSettings,
     LLMSettings,
+    MCPClientSettings,
     RedisSettings,
     RegistrySettings,
     TDWASettings,
@@ -81,6 +82,16 @@ def tdwa_settings() -> TDWASettings:
         params_weight=0.20,
         questions_weight=0.30,
         num_synthetic_questions=3,
+    )
+
+
+@pytest.fixture
+def mcp_client_settings() -> MCPClientSettings:
+    return MCPClientSettings(
+        server_list_url="/mcp/server",
+        connect_timeout_seconds=5.0,
+        call_timeout_seconds=10.0,
+        credential_ttl_seconds=60,
     )
 
 

@@ -19,6 +19,7 @@ from mcp_tool_router.context.compressor import ContextCompressor
 from mcp_tool_router.context.redis_store import RedisContextStore
 from mcp_tool_router.embeddings.client import EmbeddingClient
 from mcp_tool_router.index.store import ToolIndex
+from mcp_tool_router.mcp_client.factory import MCPClientFactory
 from mcp_tool_router.registry.client import RegistryClient
 from mcp_tool_router.settings import AppSettings
 from mcp_tool_router.sync.worker import SyncWorker
@@ -53,6 +54,15 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
     )
     sync_task = asyncio.create_task(sync.start())
 
+    mcp_client_factory = MCPClientFactory(
+        mcp_settings=settings.mcp_client,
+        registry_settings=settings.registry,
+    )
+    try:
+        await mcp_client_factory.initialize()
+    except Exception:
+        logger.warning("MCP client factory initialisation failed; tool proxying disabled")
+
     try:
         yield {
             "settings": settings,
@@ -61,8 +71,10 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
             "redis_store": redis_store,
             "compressor": compressor,
             "registry": registry,
+            "mcp_client_factory": mcp_client_factory,
         }
     finally:
+        await mcp_client_factory.close()
         await sync.stop()
         sync_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

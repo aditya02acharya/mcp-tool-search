@@ -37,3 +37,10 @@ redis:
 registry:
   sync_interval_seconds: 300
   timeout_seconds: 30.0
+
+mcp_client:
+  server_list_url: "/mcp/server"
+  connect_timeout_seconds: 30.0
+  call_timeout_seconds: 60.0
+  credential_ttl_seconds: 3600
+  aws_region: "us-east-1"
