@@ -87,6 +87,9 @@ class CredentialResolver:
         ``secret_url`` and ``role_name`` are read from the server record's
         ``env`` dict (provided by the registry), **not** from local
         environment variables.
+
+        boto3 calls are synchronous, so they are offloaded to a thread
+        via ``run_in_executor`` to avoid blocking the event loop.
         """
         try:
             import boto3  # type: ignore[import-untyped]
@@ -106,23 +109,33 @@ class CredentialResolver:
             )
             return None
 
+        import asyncio
+        import functools
+
+        loop = asyncio.get_running_loop()
+
         try:
             if self._sm_client is None:
-                sts = boto3.client("sts", region_name=self._settings.aws_region)
-                assumed = sts.assume_role(
-                    RoleArn=role_name,
-                    RoleSessionName="mcp-tool-router",
-                )
-                creds = assumed["Credentials"]
-                self._sm_client = boto3.client(
-                    "secretsmanager",
-                    region_name=self._settings.aws_region,
-                    aws_access_key_id=creds["AccessKeyId"],
-                    aws_secret_access_key=creds["SecretAccessKey"],
-                    aws_session_token=creds["SessionToken"],
-                )
+                def _create_sm_client() -> Any:
+                    sts = boto3.client("sts", region_name=self._settings.aws_region)
+                    assumed = sts.assume_role(
+                        RoleArn=role_name,
+                        RoleSessionName="mcp-tool-router",
+                    )
+                    creds = assumed["Credentials"]
+                    return boto3.client(
+                        "secretsmanager",
+                        region_name=self._settings.aws_region,
+                        aws_access_key_id=creds["AccessKeyId"],
+                        aws_secret_access_key=creds["SecretAccessKey"],
+                        aws_session_token=creds["SessionToken"],
+                    )
 
-            resp = self._sm_client.get_secret_value(SecretId=secret_url)
+                self._sm_client = await loop.run_in_executor(None, _create_sm_client)
+
+            resp = await loop.run_in_executor(
+                None, functools.partial(self._sm_client.get_secret_value, SecretId=secret_url)
+            )
             secret_str: str = resp.get("SecretString", "")
             # Secret may be a JSON blob; try to extract an "auth_value" key
             try:

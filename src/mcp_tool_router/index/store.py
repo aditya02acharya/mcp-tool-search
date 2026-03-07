@@ -21,7 +21,6 @@ import asyncio
 import json
 import logging
 import sqlite3
-import struct
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -40,13 +39,11 @@ logger = logging.getLogger(__name__)
 
 
 def _serialize_f32(vec: np.ndarray | list[float]) -> bytes:
-    arr = np.asarray(vec, dtype=np.float32)
-    return struct.pack(f"{len(arr)}f", *arr)
+    return np.asarray(vec, dtype=np.float32).tobytes()
 
 
 def _deserialize_f32(blob: bytes) -> np.ndarray:
-    count = len(blob) // 4
-    return np.array(struct.unpack(f"{count}f", blob), dtype=np.float32)
+    return np.frombuffer(blob, dtype=np.float32).copy()
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +62,7 @@ class _AsyncConnectionPool:
         self._factory = factory
         self._max_size = max_size
         self._idle: asyncio.Queue[aiosqlite.Connection] = asyncio.Queue(maxsize=max_size)
+        self._all: list[aiosqlite.Connection] = []
         self._created = 0
         self._lock = asyncio.Lock()
 
@@ -93,16 +91,25 @@ class _AsyncConnectionPool:
         async with self._lock:
             if self._created < self._max_size:
                 self._created += 1
-                return await self._factory()
+                conn = await self._factory()
+                self._all.append(conn)
+                return conn
         # Pool full – block until one is returned
         return await self._idle.get()
 
     async def close(self) -> None:
-        """Close all idle connections."""
-        while True:
+        """Close all connections (idle and checked-out)."""
+        for conn in self._all:
             try:
-                conn = self._idle.get_nowait()
                 await conn.close()
+            except Exception:
+                pass
+        self._all.clear()
+        self._created = 0
+        # Drain the idle queue
+        while not self._idle.empty():
+            try:
+                self._idle.get_nowait()
             except asyncio.QueueEmpty:
                 break
 

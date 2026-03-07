@@ -40,6 +40,7 @@ class RedisContextStore:
             password=self._settings.password,
             ssl=self._settings.ssl,
             decode_responses=True,
+            max_connections=self._settings.max_connections,
         )
 
     async def close(self) -> None:
@@ -120,18 +121,41 @@ class RedisContextStore:
         return sorted(entries, key=lambda e: e.timestamp)
 
     async def get_entry_metadata(self, session_id: str) -> list[dict[str, Any]]:
-        """Lightweight metadata (call_id, tool_name, snippet) without full results."""
-        entries = await self.get_entries(session_id)
-        return [
-            {
-                "call_id": e.call_id,
-                "tool_name": e.tool_name,
-                "snippet": e.snippet,
-                "timestamp": e.timestamp.isoformat(),
-                "size": e.content_size_bytes,
-            }
-            for e in entries
-        ]
+        """Lightweight metadata (call_id, tool_name, snippet) without full results.
+
+        Extracts only the small metadata fields from each stored JSON blob
+        without deserializing the potentially large ``result`` payload via
+        Pydantic, keeping memory usage low.
+        """
+        assert self._client is not None
+        call_ids = list(await self._client.smembers(self._session_key(session_id)))
+        if not call_ids:
+            return []
+
+        pipe = self._client.pipeline()
+        for cid in call_ids:
+            pipe.get(self._entry_key(session_id, cid))
+        raw_list: list[Any] = await pipe.execute()
+
+        import json
+
+        metadata: list[dict[str, Any]] = []
+        for data in raw_list:
+            if data is None:
+                continue
+            try:
+                obj = json.loads(data)
+                metadata.append({
+                    "call_id": obj.get("call_id", ""),
+                    "tool_name": obj.get("tool_name", ""),
+                    "snippet": obj.get("snippet", ""),
+                    "timestamp": obj.get("timestamp", ""),
+                    "size": obj.get("content_size_bytes", 0),
+                })
+            except (json.JSONDecodeError, TypeError):
+                continue
+        metadata.sort(key=lambda m: m["timestamp"])
+        return metadata
 
     async def get_session_info(self, session_id: str) -> dict[str, int]:
         assert self._client is not None

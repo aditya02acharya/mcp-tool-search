@@ -83,7 +83,8 @@ class RedisSettings(BaseComponentSettings):
     password: str | None = None
     ssl: bool = False
     session_ttl_seconds: int = 3600
-    max_context_bytes: int = 100 * 1024 * 1024  # 100 MB
+    max_context_bytes: int = 10 * 1024 * 1024  # 10 MB
+    max_connections: int = 8
 
 
 class EmbeddingSettings(BaseComponentSettings):
@@ -108,7 +109,7 @@ class IndexSettings(BaseComponentSettings):
     use_vec_extension: bool = True
     similarity_chunk_size: int = 500
     dimension: int = 4096
-    pool_size: int = 32
+    pool_size: int = 4
 
 
 class LLMSettings(BaseComponentSettings):
