@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Any
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -12,9 +12,13 @@ import pytest
 import respx  # type: ignore[import-untyped]
 
 from mcp_tool_router.mcp_client.factory import (
+    MCPAuthError,
     MCPClientError,
     MCPClientFactory,
+    MCPTransientError,
+    _classify_error,
     _is_auth_error,
+    _is_transient_error,
 )
 from mcp_tool_router.models.schemas import MCPServerCredentials, MCPServerRecord
 from mcp_tool_router.settings import MCPClientSettings, RegistrySettings
@@ -47,15 +51,26 @@ SERVER_PAYLOAD = [
 ]
 
 
+def _make_settings(**overrides: Any) -> MCPClientSettings:
+    defaults = {
+        "server_list_url": "/mcp/server",
+        "connect_timeout_seconds": 5.0,
+        "call_timeout_seconds": 10.0,
+        "credential_ttl_seconds": 60,
+        "pool_max_size": 10,
+        # Fast retries for tests — no real waiting
+        "retry_max_attempts": 3,
+        "retry_wait_multiplier": 0.0,
+        "retry_wait_min": 0.0,
+        "retry_wait_max": 0.0,
+    }
+    defaults.update(overrides)
+    return MCPClientSettings(**defaults)
+
+
 @pytest.fixture
 def mcp_settings() -> MCPClientSettings:
-    return MCPClientSettings(
-        server_list_url="/mcp/server",
-        connect_timeout_seconds=5.0,
-        call_timeout_seconds=10.0,
-        credential_ttl_seconds=60,
-        pool_max_size=10,
-    )
+    return _make_settings()
 
 
 @pytest.fixture
@@ -281,17 +296,46 @@ class TestIsAuthError:
         assert not _is_auth_error(Exception("Connection refused"))
 
 
+class TestIsTransientError:
+    def test_detects_timeout(self) -> None:
+        assert _is_transient_error(Exception("Connection timed out"))
+
+    def test_detects_502(self) -> None:
+        assert _is_transient_error(Exception("HTTP 502 Bad Gateway"))
+
+    def test_detects_503(self) -> None:
+        assert _is_transient_error(Exception("HTTP 503 Service Unavailable"))
+
+    def test_detects_connection_reset(self) -> None:
+        assert _is_transient_error(Exception("connection reset by peer"))
+
+    def test_detects_connection_refused(self) -> None:
+        assert _is_transient_error(Exception("Connection refused"))
+
+    def test_non_transient_error(self) -> None:
+        assert not _is_transient_error(Exception("Invalid JSON"))
+
+
+class TestClassifyError:
+    def test_auth_error_classified(self) -> None:
+        result = _classify_error(Exception("HTTP 401 Unauthorized"))
+        assert isinstance(result, MCPAuthError)
+
+    def test_transient_error_classified(self) -> None:
+        result = _classify_error(Exception("Connection timed out"))
+        assert isinstance(result, MCPTransientError)
+
+    def test_unknown_error_classified(self) -> None:
+        result = _classify_error(Exception("Something unexpected"))
+        assert isinstance(result, MCPClientError)
+        assert not isinstance(result, (MCPAuthError, MCPTransientError))
+
+
 class TestLRUPool:
     @respx.mock
     async def test_evicts_lru_when_pool_full(self) -> None:
         """When pool is at capacity, the least-recently-used client is evicted."""
-        settings = MCPClientSettings(
-            server_list_url="/mcp/server",
-            connect_timeout_seconds=5.0,
-            call_timeout_seconds=10.0,
-            credential_ttl_seconds=60,
-            pool_max_size=2,
-        )
+        settings = _make_settings(pool_max_size=2)
         registry_settings = RegistrySettings(base_url=REGISTRY_BASE, api_key="sk-test")
         factory = MCPClientFactory(settings, registry_settings)
 
@@ -335,17 +379,17 @@ class TestLRUPool:
         await factory.close()
 
 
-class TestAuthRetryCallTool:
+class TestTenacityRetryCallTool:
+    """Test tenacity-based retry logic for call_tool."""
+
     @respx.mock
     async def test_retries_on_auth_error_then_succeeds(self, factory: MCPClientFactory) -> None:
-        """call_tool retries once on 401 and succeeds on second attempt."""
+        """call_tool retries on 401 with credential invalidation and succeeds."""
         respx.get(f"{REGISTRY_BASE}/mcp/server").mock(
             return_value=httpx.Response(200, json=SERVER_PAYLOAD)
         )
         await factory.initialize()
 
-        # Insert a mock client that fails with 401 on first call
-        mock_client = AsyncMock()
         mock_result = MagicMock()
         mock_result.content = []
         call_count = 0
@@ -357,80 +401,190 @@ class TestAuthRetryCallTool:
                 raise Exception("HTTP 401 Unauthorized")
             return mock_result
 
+        # Insert a mock client; after disconnect (from before_sleep), _get_or_connect
+        # needs to return a fresh client. We mock _connect for the reconnect path.
+        mock_client = AsyncMock()
         mock_client.call_tool = fake_call_tool
         mock_client.is_connected.return_value = True
         factory._clients["srv-1"] = mock_client
 
-        # Mock _reconnect_with_fresh_creds to return a fresh mock
         fresh_client = AsyncMock()
         fresh_client.call_tool = fake_call_tool
         fresh_client.is_connected.return_value = True
 
-        async def fake_reconnect(sid: str) -> Any:
-            factory._clients[sid] = fresh_client
+        async def fake_connect(server: MCPServerRecord) -> Any:
+            async with factory._pool_lock:
+                factory._clients[server.server_id] = fresh_client
             return fresh_client
 
-        factory._reconnect_with_fresh_creds = fake_reconnect  # type: ignore[assignment]
+        factory._connect = fake_connect  # type: ignore[assignment]
+
+        # Track credential invalidation
+        invalidated: list[str] = []
+        orig_invalidate = factory._credentials.invalidate
+
+        def tracking_invalidate(server_id: str) -> None:
+            invalidated.append(server_id)
+            orig_invalidate(server_id)
+
+        factory._credentials.invalidate = tracking_invalidate  # type: ignore[assignment]
 
         result = await factory.call_tool("srv-1", "some-tool", {})
         assert result is mock_result
         assert call_count == 2
+        # Verify credential cache was invalidated before retry
+        assert "srv-1" in invalidated
         await factory.close()
 
     @respx.mock
-    async def test_raises_after_auth_retry_fails(self, factory: MCPClientFactory) -> None:
-        """call_tool raises MCPClientError when retry also fails."""
+    async def test_raises_after_all_retries_exhausted(self, factory: MCPClientFactory) -> None:
+        """call_tool raises MCPAuthError when all retry attempts fail."""
         respx.get(f"{REGISTRY_BASE}/mcp/server").mock(
             return_value=httpx.Response(200, json=SERVER_PAYLOAD)
         )
         await factory.initialize()
-
-        mock_client = AsyncMock()
 
         async def always_fail(name: str, args: dict, timeout: float = 60) -> None:
             raise Exception("HTTP 401 Unauthorized")
 
+        mock_client = AsyncMock()
         mock_client.call_tool = always_fail
         mock_client.is_connected.return_value = True
         factory._clients["srv-1"] = mock_client
 
-        fresh_client = AsyncMock()
-        fresh_client.call_tool = always_fail
-        fresh_client.is_connected.return_value = True
+        async def fake_connect(server: MCPServerRecord) -> Any:
+            fresh = AsyncMock()
+            fresh.call_tool = always_fail
+            fresh.is_connected.return_value = True
+            async with factory._pool_lock:
+                factory._clients[server.server_id] = fresh
+            return fresh
 
-        async def fake_reconnect(sid: str) -> Any:
-            factory._clients[sid] = fresh_client
-            return fresh_client
+        factory._connect = fake_connect  # type: ignore[assignment]
 
-        factory._reconnect_with_fresh_creds = fake_reconnect  # type: ignore[assignment]
-
-        with pytest.raises(MCPClientError, match="after auth retry"):
+        with pytest.raises(MCPAuthError):
             await factory.call_tool("srv-1", "some-tool", {})
         await factory.close()
 
     @respx.mock
-    async def test_non_auth_error_does_not_retry(self, factory: MCPClientFactory) -> None:
-        """Non-auth errors raise immediately without retry."""
+    async def test_retries_on_transient_error_then_succeeds(
+        self, factory: MCPClientFactory
+    ) -> None:
+        """call_tool retries transient errors with backoff and succeeds."""
         respx.get(f"{REGISTRY_BASE}/mcp/server").mock(
             return_value=httpx.Response(200, json=SERVER_PAYLOAD)
         )
         await factory.initialize()
 
+        mock_result = MagicMock()
+        mock_result.content = []
+        call_count = 0
+
+        async def flaky_call(name: str, args: dict, timeout: float = 60) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                raise Exception("Connection timed out")
+            return mock_result
+
         mock_client = AsyncMock()
-
-        async def timeout_fail(name: str, args: dict, timeout: float = 60) -> None:
-            raise Exception("Connection timed out")
-
-        mock_client.call_tool = timeout_fail
+        mock_client.call_tool = flaky_call
         mock_client.is_connected.return_value = True
         factory._clients["srv-1"] = mock_client
 
-        with pytest.raises(MCPClientError, match="Tool call failed"):
+        async def fake_connect(server: MCPServerRecord) -> Any:
+            fresh = AsyncMock()
+            fresh.call_tool = flaky_call
+            fresh.is_connected.return_value = True
+            async with factory._pool_lock:
+                factory._clients[server.server_id] = fresh
+            return fresh
+
+        factory._connect = fake_connect  # type: ignore[assignment]
+
+        result = await factory.call_tool("srv-1", "some-tool", {})
+        assert result is mock_result
+        assert call_count == 3
+        await factory.close()
+
+    @respx.mock
+    async def test_non_retryable_error_raises_immediately(
+        self, factory: MCPClientFactory
+    ) -> None:
+        """Non-auth, non-transient errors raise immediately without retry."""
+        respx.get(f"{REGISTRY_BASE}/mcp/server").mock(
+            return_value=httpx.Response(200, json=SERVER_PAYLOAD)
+        )
+        await factory.initialize()
+
+        call_count = 0
+
+        async def bad_call(name: str, args: dict, timeout: float = 60) -> None:
+            nonlocal call_count
+            call_count += 1
+            raise Exception("Invalid JSON response")
+
+        mock_client = AsyncMock()
+        mock_client.call_tool = bad_call
+        mock_client.is_connected.return_value = True
+        factory._clients["srv-1"] = mock_client
+
+        with pytest.raises(MCPClientError):
             await factory.call_tool("srv-1", "some-tool", {})
+        # Should have been called exactly once — no retries
+        assert call_count == 1
+        await factory.close()
+
+    @respx.mock
+    async def test_credential_invalidated_on_each_auth_retry(
+        self, factory: MCPClientFactory
+    ) -> None:
+        """Credential cache is invalidated before each auth retry attempt."""
+        respx.get(f"{REGISTRY_BASE}/mcp/server").mock(
+            return_value=httpx.Response(200, json=SERVER_PAYLOAD)
+        )
+        await factory.initialize()
+
+        async def always_401(name: str, args: dict, timeout: float = 60) -> None:
+            raise Exception("HTTP 401 Unauthorized")
+
+        mock_client = AsyncMock()
+        mock_client.call_tool = always_401
+        mock_client.is_connected.return_value = True
+        factory._clients["srv-1"] = mock_client
+
+        async def fake_connect(server: MCPServerRecord) -> Any:
+            fresh = AsyncMock()
+            fresh.call_tool = always_401
+            fresh.is_connected.return_value = True
+            async with factory._pool_lock:
+                factory._clients[server.server_id] = fresh
+            return fresh
+
+        factory._connect = fake_connect  # type: ignore[assignment]
+
+        invalidation_count = 0
+        orig_invalidate = factory._credentials.invalidate
+
+        def counting_invalidate(server_id: str) -> None:
+            nonlocal invalidation_count
+            invalidation_count += 1
+            orig_invalidate(server_id)
+
+        factory._credentials.invalidate = counting_invalidate  # type: ignore[assignment]
+
+        with pytest.raises(MCPAuthError):
+            await factory.call_tool("srv-1", "some-tool", {})
+
+        # With retry_max_attempts=3: 3 attempts, 2 sleeps (before_sleep fires
+        # between attempts), so invalidation should happen twice.
+        assert invalidation_count == 2
         await factory.close()
 
 
-class TestAuthRetryListTools:
+class TestTenacityRetryListTools:
+    """Test tenacity-based retry logic for list_tools."""
+
     @respx.mock
     async def test_list_tools_retries_on_auth_error(self, factory: MCPClientFactory) -> None:
         respx.get(f"{REGISTRY_BASE}/mcp/server").mock(
@@ -439,7 +593,6 @@ class TestAuthRetryListTools:
         await factory.initialize()
 
         call_count = 0
-        mock_client = AsyncMock()
 
         async def fake_list_tools() -> list:
             nonlocal call_count
@@ -448,6 +601,7 @@ class TestAuthRetryListTools:
                 raise Exception("HTTP 401 Unauthorized")
             return []
 
+        mock_client = AsyncMock()
         mock_client.list_tools = fake_list_tools
         mock_client.is_connected.return_value = True
         factory._clients["srv-1"] = mock_client
@@ -456,29 +610,54 @@ class TestAuthRetryListTools:
         fresh_client.list_tools = fake_list_tools
         fresh_client.is_connected.return_value = True
 
-        async def fake_reconnect(sid: str) -> Any:
-            factory._clients[sid] = fresh_client
+        async def fake_connect(server: MCPServerRecord) -> Any:
+            async with factory._pool_lock:
+                factory._clients[server.server_id] = fresh_client
             return fresh_client
 
-        factory._reconnect_with_fresh_creds = fake_reconnect  # type: ignore[assignment]
+        factory._connect = fake_connect  # type: ignore[assignment]
 
         result = await factory.list_tools("srv-1")
         assert result == []
         assert call_count == 2
         await factory.close()
 
-
-class TestReconnectWithFreshCreds:
     @respx.mock
-    async def test_reconnect_returns_none_for_unknown_server(
+    async def test_list_tools_retries_on_transient_error(
         self, factory: MCPClientFactory
     ) -> None:
         respx.get(f"{REGISTRY_BASE}/mcp/server").mock(
-            return_value=httpx.Response(200, json=[])
+            return_value=httpx.Response(200, json=SERVER_PAYLOAD)
         )
         await factory.initialize()
-        result = await factory._reconnect_with_fresh_creds("nonexistent")
-        assert result is None
+
+        call_count = 0
+
+        async def flaky_list() -> list:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise Exception("HTTP 503 Service Unavailable")
+            return []
+
+        mock_client = AsyncMock()
+        mock_client.list_tools = flaky_list
+        mock_client.is_connected.return_value = True
+        factory._clients["srv-1"] = mock_client
+
+        async def fake_connect(server: MCPServerRecord) -> Any:
+            fresh = AsyncMock()
+            fresh.list_tools = flaky_list
+            fresh.is_connected.return_value = True
+            async with factory._pool_lock:
+                factory._clients[server.server_id] = fresh
+            return fresh
+
+        factory._connect = fake_connect  # type: ignore[assignment]
+
+        result = await factory.list_tools("srv-1")
+        assert result == []
+        assert call_count == 2
         await factory.close()
 
 

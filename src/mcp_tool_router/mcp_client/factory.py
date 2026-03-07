@@ -5,7 +5,8 @@ remote MCP servers listed by the registry via ``GET /mcp/server``.
 
 Features:
 - LRU-bounded connection pool (evicts least-recently-used when full)
-- Automatic auth retry: on 401/403 invalidates credential cache and retries once
+- Tenacity-based retry: auth errors trigger credential cache invalidation
+  before each retry; transient network errors use exponential backoff
 - ``asyncio.gather``-based parallel operations for list_all_tools / disconnect
 - Authentication header injection (bearer_token, authorization, x-api-key)
 - Server input/output validation
@@ -24,6 +25,14 @@ import httpx
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 from mcp.types import CallToolResult, Tool
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+    wait_none,
+)
 
 from mcp_tool_router.mcp_client.secrets import CredentialResolver
 from mcp_tool_router.models.schemas import MCPServerRecord
@@ -44,10 +53,51 @@ class MCPClientError(Exception):
     """Raised when an MCP client operation fails."""
 
 
+class MCPAuthError(MCPClientError):
+    """Raised when an MCP operation fails due to authentication/authorisation."""
+
+
+class MCPTransientError(MCPClientError):
+    """Raised on transient network / connection errors that may succeed on retry."""
+
+
 def _is_auth_error(exc: BaseException) -> bool:
     """Return True if *exc* looks like an authentication / authorisation failure."""
     msg = str(exc).lower()
     return any(code in msg for code in ("401", "403", "unauthorized", "forbidden"))
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """Return True if *exc* looks like a transient network error worth retrying."""
+    msg = str(exc).lower()
+    transient_keywords = (
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "timed out",
+        "timeout",
+        "502",
+        "503",
+        "504",
+        "temporarily unavailable",
+        "broken pipe",
+        "eof occurred",
+    )
+    return any(kw in msg for kw in transient_keywords)
+
+
+def _classify_error(exc: BaseException) -> MCPClientError:
+    """Wrap a raw exception as either an auth or transient error for tenacity."""
+    if _is_auth_error(exc):
+        return MCPAuthError(str(exc))
+    if _is_transient_error(exc):
+        return MCPTransientError(str(exc))
+    return MCPClientError(str(exc))
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Return True for errors that tenacity should retry."""
+    return isinstance(exc, (MCPAuthError, MCPTransientError))
 
 
 class MCPClientFactory:
@@ -163,6 +213,56 @@ class MCPClientFactory:
         self._servers.clear()
 
     # ------------------------------------------------------------------
+    # Retry helpers
+    # ------------------------------------------------------------------
+
+    async def _invalidate_and_reconnect(
+        self, server_id: str, retry_state: RetryCallState
+    ) -> None:
+        """Tenacity ``before_sleep`` callback: invalidate creds on auth errors,
+        and always reconnect before the next attempt."""
+        exc = retry_state.outcome and retry_state.outcome.exception()
+        attempt = retry_state.attempt_number
+
+        if isinstance(exc, MCPAuthError):
+            logger.info(
+                "Auth failure on server %s (attempt %d); "
+                "invalidating credential cache before retry",
+                server_id,
+                attempt,
+            )
+            self._credentials.invalidate(server_id)
+            await self._disconnect_client(server_id)
+        elif isinstance(exc, MCPTransientError):
+            logger.info(
+                "Transient error on server %s (attempt %d); "
+                "reconnecting before retry: %s",
+                server_id,
+                attempt,
+                exc,
+            )
+            await self._disconnect_client(server_id)
+
+    def _build_retrying(self, server_id: str) -> AsyncRetrying:
+        """Build an ``AsyncRetrying`` instance configured for this factory."""
+        settings = self._mcp_settings
+
+        async def _before_sleep(retry_state: RetryCallState) -> None:
+            await self._invalidate_and_reconnect(server_id, retry_state)
+
+        return AsyncRetrying(
+            stop=stop_after_attempt(settings.retry_max_attempts),
+            wait=wait_exponential(
+                multiplier=settings.retry_wait_multiplier,
+                min=settings.retry_wait_min,
+                max=settings.retry_wait_max,
+            ),
+            retry=retry_if_exception(_is_retryable),
+            before_sleep=_before_sleep,
+            reraise=True,
+        )
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -172,21 +272,23 @@ class MCPClientFactory:
 
     async def list_tools(self, server_id: str) -> list[Tool]:
         """List all tools available on a specific server."""
-        client = await self._get_or_connect(server_id)
         try:
-            return await client.list_tools()
-        except Exception as exc:
-            if _is_auth_error(exc):
-                client = await self._reconnect_with_fresh_creds(server_id)
-                if client:
+            async for attempt in self._build_retrying(server_id):
+                with attempt:
+                    client = await self._get_or_connect(server_id)
                     try:
                         return await client.list_tools()
-                    except Exception:
-                        logger.debug("Retry also failed for server %s", server_id)
+                    except MCPClientError:
+                        raise
+                    except Exception as exc:
+                        raise _classify_error(exc) from exc
+        except MCPClientError:
             logger.exception("Failed to list tools for server %s", server_id)
             await self._disconnect_client(server_id)
-            msg = f"Failed to list tools for server {server_id}: {exc}"
-            raise MCPClientError(msg) from exc
+            raise
+        # Unreachable, but keeps mypy happy
+        msg = f"Failed to list tools for server {server_id}"  # pragma: no cover
+        raise MCPClientError(msg)  # pragma: no cover
 
     async def list_all_tools(self) -> dict[str, list[Tool]]:
         """List tools from every registered server in parallel.
@@ -213,31 +315,18 @@ class MCPClientFactory:
     ) -> CallToolResult:
         """Execute a tool on a remote MCP server.
 
-        On authentication failure (401/403) the credential cache is
-        invalidated, a fresh connection is established, and the call is
-        retried **once**.  If it still fails the error is raised.
+        Uses tenacity for retries:
+        - Auth failures (401/403): credential cache is invalidated before
+          each retry attempt via ``before_sleep``.
+        - Transient errors (timeouts, 502/503/504): retried with
+          exponential backoff.
+        - Non-retryable errors: raised immediately.
         """
         self._validate_call_input(server_id, tool_name, arguments)
-        client = await self._get_or_connect(server_id)
         try:
-            result = await client.call_tool(
-                tool_name,
-                arguments or {},
-                timeout=self._mcp_settings.call_timeout_seconds,
-            )
-            self._validate_call_output(result)
-            return result
-        except MCPClientError:
-            raise
-        except Exception as exc:
-            # --- Auth retry path ---
-            if _is_auth_error(exc):
-                logger.info(
-                    "Auth failure calling %s on %s; retrying with fresh credentials",
-                    tool_name, server_id,
-                )
-                client = await self._reconnect_with_fresh_creds(server_id)
-                if client:
+            async for attempt in self._build_retrying(server_id):
+                with attempt:
+                    client = await self._get_or_connect(server_id)
                     try:
                         result = await client.call_tool(
                             tool_name,
@@ -246,19 +335,19 @@ class MCPClientFactory:
                         )
                         self._validate_call_output(result)
                         return result
-                    except Exception as retry_exc:
-                        await self._disconnect_client(server_id)
-                        msg = (
-                            f"Tool call failed on {server_id} after auth retry: {retry_exc}"
-                        )
-                        raise MCPClientError(msg) from retry_exc
-
+                    except MCPClientError:
+                        raise
+                    except Exception as exc:
+                        raise _classify_error(exc) from exc
+        except MCPClientError:
             logger.exception(
                 "Tool call failed: server=%s tool=%s", server_id, tool_name
             )
             await self._disconnect_client(server_id)
-            msg = f"Tool call failed on server {server_id}: {exc}"
-            raise MCPClientError(msg) from exc
+            raise
+        # Unreachable, but keeps mypy happy
+        msg = f"Tool call failed on server {server_id}"  # pragma: no cover
+        raise MCPClientError(msg)  # pragma: no cover
 
     # ------------------------------------------------------------------
     # Connection management (LRU pool)
@@ -317,19 +406,6 @@ class MCPClientFactory:
                 await client.__aexit__(None, None, None)
             msg = f"Connection to server {server.server_id} failed: {exc}"
             raise MCPClientError(msg) from exc
-
-    async def _reconnect_with_fresh_creds(self, server_id: str) -> Client | None:
-        """Invalidate cached creds, disconnect, and reconnect."""
-        self._credentials.invalidate(server_id)
-        await self._disconnect_client(server_id)
-        server = self._servers.get(server_id)
-        if server is None:
-            return None
-        try:
-            return await self._connect(server)
-        except MCPClientError:
-            logger.warning("Reconnect with fresh creds failed for server %s", server_id)
-            return None
 
     async def _disconnect_client(self, server_id: str) -> None:
         """Gracefully disconnect a client if it exists."""
