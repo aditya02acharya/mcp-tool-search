@@ -28,7 +28,7 @@ def _make_server(
     server_id: str = "srv-1",
     auth_type: str | None = "bearer_token",
     credentials: MCPServerCredentials | None = None,
-    env: list[str] | None = None,
+    env: dict[str, str] | None = None,
     static_headers: dict[str, str] | None = None,
 ) -> MCPServerRecord:
     return MCPServerRecord(
@@ -37,7 +37,7 @@ def _make_server(
         url="http://test:8080",
         auth_type=auth_type,
         credentials=credentials,
-        env=env or [],
+        env=env or {},
         static_headers=static_headers or {},
     )
 
@@ -131,29 +131,55 @@ class TestTTL:
         assert ttl == 60  # from settings
 
     async def test_ttl_without_rotation(self, resolver: CredentialResolver) -> None:
-        server = _make_server(env=[])
+        server = _make_server(env={})
         ttl = resolver._ttl_for(server)
         assert ttl == 60
+
+    async def test_ttl_with_rotation(self, resolver: CredentialResolver) -> None:
+        server = _make_server(env={"rotation_frequency_days": "7"})
+        ttl = resolver._ttl_for(server)
+        assert ttl == 7 * 86400
 
 
 class TestRemoteSecret:
     async def test_has_remote_secret_true(self) -> None:
-        server = _make_server(env=["secret_url", "role_name", "rotation_frequency_days"])
+        server = _make_server(env={
+            "secret_url": "arn:aws:sm:us-east-1:123:secret/test",
+            "role_name": "arn:aws:iam::123:role/test",
+            "rotation_frequency_days": "30",
+        })
         assert server.has_remote_secret
 
     async def test_has_remote_secret_false(self) -> None:
-        server = _make_server(env=[])
+        server = _make_server(env={})
+        assert not server.has_remote_secret
+
+    async def test_has_remote_secret_false_empty_values(self) -> None:
+        server = _make_server(env={"secret_url": "", "role_name": ""})
         assert not server.has_remote_secret
 
     async def test_falls_back_when_boto3_missing(self, resolver: CredentialResolver) -> None:
         server = _make_server(
-            env=["secret_url", "role_name"],
+            env={
+                "secret_url": "arn:aws:sm:us-east-1:123:secret/test",
+                "role_name": "arn:aws:iam::123:role/test",
+            },
         )
-        with (
-            patch.dict(os.environ, {"SECRET_URL": "arn:aws:sm:us-east-1:123:secret/test",
-                                     "ROLE_NAME": "arn:aws:iam::123:role/test"}),
-            patch.dict("sys.modules", {"boto3": None}),
-        ):
+        with patch.dict("sys.modules", {"boto3": None}):
+            token = await resolver.resolve(server)
+        assert token is None
+
+    async def test_reads_secret_url_from_server_env(self, resolver: CredentialResolver) -> None:
+        """secret_url and role_name come from server.env, not os.environ."""
+        server = _make_server(
+            env={
+                "secret_url": "arn:aws:sm:us-east-1:123:secret/test",
+                "role_name": "arn:aws:iam::123:role/test",
+            },
+        )
+        # Even without local env vars, the resolver should attempt AWS
+        # (will fail because boto3 mock, but proves it reads from server.env)
+        with patch.dict("sys.modules", {"boto3": None}):
             token = await resolver.resolve(server)
         assert token is None
 

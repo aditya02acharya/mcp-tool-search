@@ -165,6 +165,7 @@ class MCPClientSettings(BaseComponentSettings):
     call_timeout_seconds: float = 60.0
     credential_ttl_seconds: int = 3600
     aws_region: str = "us-east-1"
+    pool_max_size: int = 10
 
 
 class ServerSettings(BaseComponentSettings):

@@ -2,7 +2,7 @@
 
 Supports two backends:
 1. AWS Secrets Manager – when ``secret_url`` and ``role_name`` are present in
-   the server env list.
+   the server ``env`` dict (values provided by the registry).
 2. Local environment variables – fallback using the variable name declared in
    ``credentials.auth_value`` or ``static_headers``.
 """
@@ -82,7 +82,12 @@ class CredentialResolver:
         return self._fetch_from_env(server)
 
     async def _fetch_from_aws(self, server: MCPServerRecord) -> str | None:
-        """Retrieve a secret from AWS Secrets Manager."""
+        """Retrieve a secret from AWS Secrets Manager.
+
+        ``secret_url`` and ``role_name`` are read from the server record's
+        ``env`` dict (provided by the registry), **not** from local
+        environment variables.
+        """
         try:
             import boto3  # type: ignore[import-untyped]
         except ImportError:
@@ -92,11 +97,11 @@ class CredentialResolver:
             )
             return None
 
-        secret_url = os.environ.get("SECRET_URL", "")
-        role_name = os.environ.get("ROLE_NAME", "")
+        secret_url = server.env.get("secret_url", "")
+        role_name = server.env.get("role_name", "")
         if not secret_url or not role_name:
             logger.warning(
-                "secret_url or role_name env var not set for server %s",
+                "secret_url or role_name not set in server env for server %s",
                 server.server_id,
             )
             return None
@@ -132,6 +137,9 @@ class CredentialResolver:
             return secret_str
         except Exception:
             logger.exception("Failed to fetch secret from AWS for server %s", server.server_id)
+            # Invalidate the SM client so it's recreated on next attempt
+            # (STS credentials may have expired).
+            self._sm_client = None
             return None
 
     def _fetch_from_env(self, server: MCPServerRecord) -> str | None:

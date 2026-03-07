@@ -74,14 +74,19 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
             "mcp_client_factory": mcp_client_factory,
         }
     finally:
-        await mcp_client_factory.close()
+        # Stop sync worker first (it depends on registry + index)
         await sync.stop()
         sync_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await sync_task
-        await embeddings.close()
-        await registry.close()
-        await redis_store.close()
+        # Shut down independent services in parallel
+        await asyncio.gather(
+            mcp_client_factory.close(),
+            embeddings.close(),
+            registry.close(),
+            redis_store.close(),
+            return_exceptions=True,
+        )
         await index.close()
 
 
