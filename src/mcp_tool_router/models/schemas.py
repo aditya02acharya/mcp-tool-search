@@ -126,17 +126,21 @@ class MCPServerRecord(BaseModel):
     auth_type: str | None = None
     credentials: MCPServerCredentials | None = None
     url: str
-    env: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
     static_headers: dict[str, str] = Field(default_factory=dict)
 
     @property
     def has_remote_secret(self) -> bool:
         """True when the secret is stored in AWS Secrets Manager."""
-        return "secret_url" in self.env and "role_name" in self.env
+        return bool(self.env.get("secret_url")) and bool(self.env.get("role_name"))
 
     @property
     def rotation_frequency_days(self) -> int | None:
         """Return rotation frequency if declared, else None."""
-        if "rotation_frequency_days" not in self.env:
+        val = self.env.get("rotation_frequency_days")
+        if val is None:
             return None
-        return None  # actual value comes from the remote config
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None

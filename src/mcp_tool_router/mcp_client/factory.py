@@ -1,20 +1,23 @@
-"""MCP Client Factory – manages connections to remote MCP servers.
+"""MCP Client Factory – manages a bounded pool of connections to remote MCP servers.
 
 Uses ``fastmcp.Client`` with ``StreamableHttpTransport`` to interact with
 remote MCP servers listed by the registry via ``GET /mcp/server``.
 
 Features:
-- Lazy connection establishment per server
+- LRU-bounded connection pool (evicts least-recently-used when full)
+- Automatic auth retry: on 401/403 invalidates credential cache and retries once
+- ``asyncio.gather``-based parallel operations for list_all_tools / disconnect
 - Authentication header injection (bearer_token, authorization, x-api-key)
-- AsyncExitStack-based resource management
 - Server input/output validation
 - Graceful disconnection handling
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
-from contextlib import AsyncExitStack
+from collections import OrderedDict
 from typing import Any
 
 import httpx
@@ -33,13 +36,27 @@ _MAX_ARG_VALUE_LEN = 1_000_000
 # Maximum allowed response content length (chars) before truncation.
 _MAX_RESPONSE_LEN = 5_000_000
 
+# HTTP status codes that trigger an auth retry.
+_AUTH_FAILURE_CODES = {401, 403}
+
 
 class MCPClientError(Exception):
     """Raised when an MCP client operation fails."""
 
 
+def _is_auth_error(exc: BaseException) -> bool:
+    """Return True if *exc* looks like an authentication / authorisation failure."""
+    msg = str(exc).lower()
+    return any(code in msg for code in ("401", "403", "unauthorized", "forbidden"))
+
+
 class MCPClientFactory:
-    """Manage connections to remote MCP servers discovered from the registry.
+    """Manage a bounded pool of connections to remote MCP servers.
+
+    The pool follows an LRU eviction strategy: when ``pool_max_size`` is
+    reached the least-recently-used connection is closed before a new one
+    is opened.  This keeps memory and file-descriptor usage predictable
+    inside a 1-CPU / 1 GB container.
 
     Usage::
 
@@ -60,8 +77,11 @@ class MCPClientFactory:
         self._credentials = CredentialResolver(mcp_settings)
         self._http: httpx.AsyncClient | None = None
         self._servers: dict[str, MCPServerRecord] = {}
-        self._clients: dict[str, Client] = {}
-        self._exit_stack = AsyncExitStack()
+        # OrderedDict tracks insertion/access order for LRU eviction.
+        self._clients: OrderedDict[str, Client] = OrderedDict()
+        self._pool_max_size: int = mcp_settings.pool_max_size
+        # Guards pool mutations so concurrent callers don't race on eviction.
+        self._pool_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -105,10 +125,14 @@ class MCPClientFactory:
                     new_servers[record.server_id] = record
                 except Exception:
                     logger.warning("Skipping invalid server record: %s", item, exc_info=True)
-            # Disconnect clients for servers no longer in the list
+
+            # Disconnect clients for servers no longer in the list — in parallel
             removed = set(self._servers) - set(new_servers)
-            for sid in removed:
-                await self._disconnect_client(sid)
+            if removed:
+                await asyncio.gather(
+                    *(self._disconnect_client(sid) for sid in removed),
+                    return_exceptions=True,
+                )
             self._servers = new_servers
             logger.info("Loaded %d MCP server(s) from registry", len(self._servers))
         except httpx.HTTPStatusError:
@@ -120,9 +144,12 @@ class MCPClientFactory:
 
     async def close(self) -> None:
         """Disconnect all clients and release resources."""
-        for sid in list(self._clients):
-            await self._disconnect_client(sid)
-        await self._exit_stack.aclose()
+        # Close all pooled clients in parallel
+        if self._clients:
+            await asyncio.gather(
+                *(self._disconnect_client(sid) for sid in list(self._clients)),
+                return_exceptions=True,
+            )
         if self._http:
             await self._http.aclose()
             self._http = None
@@ -143,24 +170,34 @@ class MCPClientFactory:
         try:
             return await client.list_tools()
         except Exception as exc:
+            if _is_auth_error(exc):
+                client = await self._reconnect_with_fresh_creds(server_id)
+                if client:
+                    try:
+                        return await client.list_tools()
+                    except Exception:
+                        logger.debug("Retry also failed for server %s", server_id)
             logger.exception("Failed to list tools for server %s", server_id)
             await self._disconnect_client(server_id)
             msg = f"Failed to list tools for server {server_id}: {exc}"
             raise MCPClientError(msg) from exc
 
     async def list_all_tools(self) -> dict[str, list[Tool]]:
-        """List tools from every registered server.
+        """List tools from every registered server in parallel.
 
         Returns a mapping of ``server_id`` -> tool list.
         """
-        result: dict[str, list[Tool]] = {}
-        for sid in list(self._servers):
+        sids = list(self._servers)
+
+        async def _safe_list(sid: str) -> tuple[str, list[Tool]]:
             try:
-                result[sid] = await self.list_tools(sid)
+                return sid, await self.list_tools(sid)
             except MCPClientError:
                 logger.warning("Skipping server %s due to connection error", sid)
-                result[sid] = []
-        return result
+                return sid, []
+
+        results = await asyncio.gather(*(_safe_list(sid) for sid in sids))
+        return dict(results)
 
     async def call_tool(
         self,
@@ -170,16 +207,9 @@ class MCPClientFactory:
     ) -> CallToolResult:
         """Execute a tool on a remote MCP server.
 
-        Args:
-            server_id: The target server identifier.
-            tool_name: Name of the tool to invoke.
-            arguments: Tool arguments as a JSON-serialisable dict.
-
-        Returns:
-            The ``CallToolResult`` from the remote server.
-
-        Raises:
-            MCPClientError: On validation failure, connection, or execution errors.
+        On authentication failure (401/403) the credential cache is
+        invalidated, a fresh connection is established, and the call is
+        retried **once**.  If it still fails the error is raised.
         """
         self._validate_call_input(server_id, tool_name, arguments)
         client = await self._get_or_connect(server_id)
@@ -194,6 +224,29 @@ class MCPClientFactory:
         except MCPClientError:
             raise
         except Exception as exc:
+            # --- Auth retry path ---
+            if _is_auth_error(exc):
+                logger.info(
+                    "Auth failure calling %s on %s; retrying with fresh credentials",
+                    tool_name, server_id,
+                )
+                client = await self._reconnect_with_fresh_creds(server_id)
+                if client:
+                    try:
+                        result = await client.call_tool(
+                            tool_name,
+                            arguments or {},
+                            timeout=self._mcp_settings.call_timeout_seconds,
+                        )
+                        self._validate_call_output(result)
+                        return result
+                    except Exception as retry_exc:
+                        await self._disconnect_client(server_id)
+                        msg = (
+                            f"Tool call failed on {server_id} after auth retry: {retry_exc}"
+                        )
+                        raise MCPClientError(msg) from retry_exc
+
             logger.exception(
                 "Tool call failed: server=%s tool=%s", server_id, tool_name
             )
@@ -202,14 +255,20 @@ class MCPClientFactory:
             raise MCPClientError(msg) from exc
 
     # ------------------------------------------------------------------
-    # Connection management
+    # Connection management (LRU pool)
     # ------------------------------------------------------------------
 
     async def _get_or_connect(self, server_id: str) -> Client:
-        """Return an existing client or create a new connection."""
-        client = self._clients.get(server_id)
-        if client and client.is_connected():
-            return client
+        """Return an existing client or create a new connection.
+
+        Moves the accessed entry to the end of the LRU order.
+        """
+        async with self._pool_lock:
+            client = self._clients.get(server_id)
+            if client and client.is_connected():
+                # Touch: move to end (most-recently-used)
+                self._clients.move_to_end(server_id)
+                return client
 
         server = self._servers.get(server_id)
         if server is None:
@@ -219,7 +278,7 @@ class MCPClientFactory:
         return await self._connect(server)
 
     async def _connect(self, server: MCPServerRecord) -> Client:
-        """Establish a new connection to a remote MCP server."""
+        """Establish a new connection, evicting the LRU entry if the pool is full."""
         headers = await self._build_headers(server)
         transport = StreamableHttpTransport(
             url=server.url,
@@ -230,24 +289,56 @@ class MCPClientFactory:
             timeout=self._mcp_settings.connect_timeout_seconds,
         )
         try:
-            ctx = await self._exit_stack.enter_async_context(client)
-            self._clients[server.server_id] = ctx
+            ctx = await client.__aenter__()
+
+            async with self._pool_lock:
+                # Evict LRU if pool is at capacity
+                while len(self._clients) >= self._pool_max_size:
+                    evict_sid, evict_client = self._clients.popitem(last=False)
+                    logger.info("Evicting LRU client for server %s", evict_sid)
+                    # Schedule close outside the lock to avoid holding it during I/O
+                    _bg = asyncio.ensure_future(self._safe_close_client(evict_client))  # noqa: RUF006
+
+                self._clients[server.server_id] = ctx
+
             logger.info("Connected to MCP server %s at %s", server.server_id, server.url)
             return ctx
         except Exception as exc:
             logger.exception("Failed to connect to server %s at %s", server.server_id, server.url)
+            # Best-effort cleanup of the partially-opened client
+            with contextlib.suppress(Exception):
+                await client.__aexit__(None, None, None)
             msg = f"Connection to server {server.server_id} failed: {exc}"
             raise MCPClientError(msg) from exc
 
+    async def _reconnect_with_fresh_creds(self, server_id: str) -> Client | None:
+        """Invalidate cached creds, disconnect, and reconnect."""
+        self._credentials.invalidate(server_id)
+        await self._disconnect_client(server_id)
+        server = self._servers.get(server_id)
+        if server is None:
+            return None
+        try:
+            return await self._connect(server)
+        except MCPClientError:
+            logger.warning("Reconnect with fresh creds failed for server %s", server_id)
+            return None
+
     async def _disconnect_client(self, server_id: str) -> None:
         """Gracefully disconnect a client if it exists."""
-        client = self._clients.pop(server_id, None)
+        async with self._pool_lock:
+            client = self._clients.pop(server_id, None)
         if client is not None:
-            try:
-                if client.is_connected():
-                    await client.close()
-            except Exception:
-                logger.debug("Error closing client for server %s", server_id, exc_info=True)
+            await self._safe_close_client(client)
+
+    @staticmethod
+    async def _safe_close_client(client: Client) -> None:
+        """Close a client, suppressing any errors."""
+        try:
+            if client.is_connected():
+                await client.__aexit__(None, None, None)
+        except Exception:
+            logger.debug("Error closing client", exc_info=True)
 
     # ------------------------------------------------------------------
     # Authentication
