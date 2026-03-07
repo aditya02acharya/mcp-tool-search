@@ -167,6 +167,11 @@ class MCPClientSettings(BaseComponentSettings):
     credential_ttl_seconds: int = 3600
     aws_region: str = "us-east-1"
     pool_max_size: int = 10
+    # Retry settings (tenacity)
+    retry_max_attempts: int = 3
+    retry_wait_multiplier: float = 1.0
+    retry_wait_min: float = 1.0
+    retry_wait_max: float = 10.0
 
 
 class ServerSettings(BaseComponentSettings):
