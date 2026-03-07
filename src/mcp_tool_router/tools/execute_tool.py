@@ -3,10 +3,7 @@
 Returns a short ``call_id`` the agent can reference later via
 ``retrieve_context``, plus an immediate LLM summary and gap analysis.
 
-Supports two execution paths:
-1. **MCP client** (preferred) – when ``server_id`` is provided, the call is
-   routed through the ``MCPClientFactory`` to the remote MCP server.
-2. **Registry REST proxy** – legacy fallback via the ``RegistryClient``.
+Routes tool calls through the ``MCPClientFactory`` to the remote MCP server.
 """
 
 from __future__ import annotations
@@ -25,7 +22,7 @@ async def execute_tool(
     session_id: str,
     tool_name: str,
     arguments: dict[str, Any] | None = None,
-    server_id: str | None = None,
+    server_id: str = "",
 ) -> dict[str, Any]:
     """Execute a tool on a remote MCP server and accumulate the result.
 
@@ -33,9 +30,7 @@ async def execute_tool(
         session_id: Caller's session identifier.
         tool_name: Name of the tool to call.
         arguments: Tool arguments (JSON object).
-        server_id: Target MCP server identifier. When provided, the call is
-            routed through the MCP client factory instead of the registry
-            REST proxy.
+        server_id: Target MCP server identifier.
 
     Returns:
         ``call_id`` for citation, a quick summary, and any information gaps.
@@ -43,25 +38,26 @@ async def execute_tool(
     app = ctx.request_context.lifespan_context  # type: ignore[union-attr]
     args = arguments or {}
 
-    # Route through MCP client factory when a server_id is specified
-    if server_id and "mcp_client_factory" in app:
-        try:
-            call_result = await app["mcp_client_factory"].call_tool(server_id, tool_name, args)
-            # Extract text content from CallToolResult
-            result: Any = [
-                getattr(c, "text", str(c)) for c in call_result.content
-            ]
-            if len(result) == 1:
-                result = result[0]
-        except MCPClientError as exc:
-            return {
-                "error": str(exc),
-                "tool_name": tool_name,
-                "server_id": server_id,
-            }
-    else:
-        # Legacy: proxy the call via the REST registry
-        result = await app["registry"].call_tool(tool_name, args)
+    if not server_id:
+        return {
+            "error": "server_id is required to route the tool call",
+            "tool_name": tool_name,
+        }
+
+    try:
+        call_result = await app["mcp_client_factory"].call_tool(server_id, tool_name, args)
+        # Extract text content from CallToolResult
+        result: Any = [
+            getattr(c, "text", str(c)) for c in call_result.content
+        ]
+        if len(result) == 1:
+            result = result[0]
+    except MCPClientError as exc:
+        return {
+            "error": str(exc),
+            "tool_name": tool_name,
+            "server_id": server_id,
+        }
 
     # Build a snippet for lightweight metadata queries
     snippet = json.dumps(result, default=str)[:200]

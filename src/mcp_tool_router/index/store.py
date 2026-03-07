@@ -187,6 +187,7 @@ class ToolIndex:
             CREATE TABLE IF NOT EXISTS tools (
                 name            TEXT PRIMARY KEY,
                 description     TEXT NOT NULL,
+                server_id       TEXT NOT NULL DEFAULT '',
                 input_schema    TEXT NOT NULL DEFAULT '{}',
                 output_schema   TEXT,
                 tags            TEXT NOT NULL DEFAULT '[]',
@@ -239,11 +240,12 @@ class ToolIndex:
             if existing:
                 rowid = existing["rowid"]
                 await conn.execute(
-                    """UPDATE tools SET description=?, input_schema=?, output_schema=?,
-                       tags=?, content_hash=?, synthetic_questions=?, embedding=?
-                       WHERE name=?""",
+                    """UPDATE tools SET description=?, server_id=?, input_schema=?,
+                       output_schema=?, tags=?, content_hash=?, synthetic_questions=?,
+                       embedding=? WHERE name=?""",
                     (
                         tool.description,
+                        tool.server_id,
                         json.dumps(tool.input_schema),
                         json.dumps(tool.output_schema) if tool.output_schema else None,
                         json.dumps(tool.tags),
@@ -285,12 +287,13 @@ class ToolIndex:
                     )
             else:
                 cursor = await conn.execute(
-                    """INSERT INTO tools(name, description, input_schema, output_schema,
-                       tags, content_hash, synthetic_questions, embedding)
-                       VALUES(?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO tools(name, description, server_id, input_schema,
+                       output_schema, tags, content_hash, synthetic_questions, embedding)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
                     (
                         tool.name,
                         tool.description,
+                        tool.server_id,
                         json.dumps(tool.input_schema),
                         json.dumps(tool.output_schema) if tool.output_schema else None,
                         json.dumps(tool.tags),
@@ -523,7 +526,8 @@ class ToolIndex:
         self, conn: aiosqlite.Connection, name: str, score: float
     ) -> SearchResult:
         cursor = await conn.execute(
-            "SELECT name, description, input_schema, output_schema, tags FROM tools WHERE name=?",
+            "SELECT name, description, server_id, input_schema, output_schema, tags "
+            "FROM tools WHERE name=?",
             (name,),
         )
         row = await cursor.fetchone()
@@ -532,6 +536,7 @@ class ToolIndex:
         return SearchResult(
             name=row["name"],
             description=row["description"],
+            server_id=row["server_id"],
             input_schema=json.loads(row["input_schema"]),
             output_schema=json.loads(row["output_schema"]) if row["output_schema"] else None,
             tags=json.loads(row["tags"]),
@@ -543,6 +548,7 @@ class ToolIndex:
         return IndexedTool(
             name=row["name"],
             description=row["description"],
+            server_id=row["server_id"],
             input_schema=json.loads(row["input_schema"]),
             output_schema=json.loads(row["output_schema"]) if row["output_schema"] else None,
             tags=json.loads(row["tags"]),

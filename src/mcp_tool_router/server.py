@@ -20,7 +20,6 @@ from mcp_tool_router.context.redis_store import RedisContextStore
 from mcp_tool_router.embeddings.client import EmbeddingClient
 from mcp_tool_router.index.store import ToolIndex
 from mcp_tool_router.mcp_client.factory import MCPClientFactory
-from mcp_tool_router.registry.client import RegistryClient
 from mcp_tool_router.settings import AppSettings
 from mcp_tool_router.sync.worker import SyncWorker
 from mcp_tool_router.tools.execute_tool import execute_tool
@@ -42,17 +41,6 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
     redis_store = RedisContextStore(settings.redis)
     await redis_store.connect()
     compressor = ContextCompressor(settings.llm)
-    registry = RegistryClient(settings.registry)
-
-    sync = SyncWorker(
-        registry=registry,
-        index=index,
-        embeddings=embeddings,
-        registry_settings=settings.registry,
-        tdwa_settings=settings.tdwa,
-        llm_settings=settings.llm,
-    )
-    sync_task = asyncio.create_task(sync.start())
 
     mcp_client_factory = MCPClientFactory(
         mcp_settings=settings.mcp_client,
@@ -63,6 +51,16 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
     except Exception:
         logger.warning("MCP client factory initialisation failed; tool proxying disabled")
 
+    sync = SyncWorker(
+        mcp_client=mcp_client_factory,
+        index=index,
+        embeddings=embeddings,
+        registry_settings=settings.registry,
+        tdwa_settings=settings.tdwa,
+        llm_settings=settings.llm,
+    )
+    sync_task = asyncio.create_task(sync.start())
+
     try:
         yield {
             "settings": settings,
@@ -70,11 +68,10 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
             "index": index,
             "redis_store": redis_store,
             "compressor": compressor,
-            "registry": registry,
             "mcp_client_factory": mcp_client_factory,
         }
     finally:
-        # Stop sync worker first (it depends on registry + index)
+        # Stop sync worker first (it depends on mcp_client + index)
         await sync.stop()
         sync_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -83,7 +80,6 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
         await asyncio.gather(
             mcp_client_factory.close(),
             embeddings.close(),
-            registry.close(),
             redis_store.close(),
             return_exceptions=True,
         )

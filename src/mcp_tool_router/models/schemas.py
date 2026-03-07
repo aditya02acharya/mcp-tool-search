@@ -12,12 +12,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ToolRecord(BaseModel):
-    """A tool fetched from the upstream registry."""
+    """A tool fetched from a remote MCP server."""
 
     model_config = ConfigDict(populate_by_name=True)
 
     name: str
     description: str
+    server_id: str = ""
     input_schema: dict[str, Any] = Field(alias="inputSchema", default_factory=dict)
     output_schema: dict[str, Any] | None = Field(alias="outputSchema", default=None)
     meta: dict[str, Any] | None = None
@@ -52,6 +53,7 @@ class IndexedTool(BaseModel):
 
     name: str
     description: str
+    server_id: str = ""
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] | None = None
     tags: list[str] = Field(default_factory=list)
@@ -65,6 +67,7 @@ class SearchResult(BaseModel):
 
     name: str
     description: str
+    server_id: str = ""
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] | None = None
     tags: list[str] = Field(default_factory=list)

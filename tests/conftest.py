@@ -14,7 +14,7 @@ from mcp_tool_router.context.compressor import ContextCompressor
 from mcp_tool_router.context.redis_store import RedisContextStore
 from mcp_tool_router.embeddings.client import EmbeddingClient
 from mcp_tool_router.index.store import ToolIndex
-from mcp_tool_router.models.schemas import ContextEntry, IndexedTool, ToolRecord
+from mcp_tool_router.models.schemas import ContextEntry, IndexedTool
 from mcp_tool_router.settings import (
     AppSettings,
     EmbeddingSettings,

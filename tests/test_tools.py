@@ -8,11 +8,13 @@ from unittest.mock import AsyncMock
 
 import numpy as np
 import pytest
+from mcp.types import CallToolResult, TextContent
 
 from mcp_tool_router.context.compressor import ContextCompressor
 from mcp_tool_router.context.redis_store import RedisContextStore
 from mcp_tool_router.embeddings.client import EmbeddingClient
 from mcp_tool_router.index.store import ToolIndex
+from mcp_tool_router.mcp_client.factory import MCPClientFactory
 from mcp_tool_router.settings import AppSettings, SearchSettings
 from mcp_tool_router.tools.execute_tool import execute_tool
 from mcp_tool_router.tools.retrieve_context import retrieve_context
@@ -40,8 +42,10 @@ async def app_ctx(
     embeddings.embed_query.return_value = (
         np.random.default_rng(1).standard_normal(DIM).astype(np.float32)
     )
-    registry = AsyncMock()
-    registry.call_tool.return_value = {"temp": 20, "unit": "C"}
+    mcp_client_factory = AsyncMock(spec=MCPClientFactory)
+    mcp_client_factory.call_tool.return_value = CallToolResult(
+        content=[TextContent(type="text", text='{"temp": 20, "unit": "C"}')]
+    )
     compressor = AsyncMock(spec=ContextCompressor)
     compressor.quick_summarise.return_value = {"summary": "It's 20C", "gaps": []}
     compressor.summarise.return_value = SimpleNamespace(
@@ -70,7 +74,7 @@ async def app_ctx(
         "index": tool_index,
         "redis_store": redis_store,
         "compressor": compressor,
-        "registry": registry,
+        "mcp_client_factory": mcp_client_factory,
     }
 
 
@@ -107,6 +111,7 @@ class TestExecuteTool:
             session_id="sess-1",
             tool_name="get_weather",
             arguments={"loc": "London"},
+            server_id="server-1",
         )
         assert "call_id" in result
         assert len(result["call_id"]) == 12
@@ -118,11 +123,18 @@ class TestExecuteTool:
     ) -> None:
         ctx = FakeContext(app_ctx)
         result = await execute_tool(  # type: ignore[arg-type]
-            ctx, session_id="sess-2", tool_name="get_weather"
+            ctx, session_id="sess-2", tool_name="get_weather", server_id="server-1"
         )
         entries = await redis_store.get_entries("sess-2")
         assert len(entries) == 1
         assert entries[0].call_id == result["call_id"]
+
+    async def test_returns_error_without_server_id(self, app_ctx: dict[str, Any]) -> None:
+        ctx = FakeContext(app_ctx)
+        result = await execute_tool(  # type: ignore[arg-type]
+            ctx, session_id="sess-err", tool_name="get_weather"
+        )
+        assert "error" in result
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +147,7 @@ class TestRetrieveContext:
         ctx = FakeContext(app_ctx)
         # First accumulate something
         exec_result = await execute_tool(  # type: ignore[arg-type]
-            ctx, session_id="sess-3", tool_name="get_weather"
+            ctx, session_id="sess-3", tool_name="get_weather", server_id="server-1"
         )
         cid = exec_result["call_id"]
 
@@ -149,7 +161,7 @@ class TestRetrieveContext:
     async def test_summary_mode(self, app_ctx: dict[str, Any]) -> None:
         ctx = FakeContext(app_ctx)
         await execute_tool(  # type: ignore[arg-type]
-            ctx, session_id="sess-4", tool_name="get_weather"
+            ctx, session_id="sess-4", tool_name="get_weather", server_id="server-1"
         )
         result = await retrieve_context(  # type: ignore[arg-type]
             ctx, session_id="sess-4", query="temperature"
@@ -160,7 +172,7 @@ class TestRetrieveContext:
     async def test_metadata_mode(self, app_ctx: dict[str, Any]) -> None:
         ctx = FakeContext(app_ctx)
         await execute_tool(  # type: ignore[arg-type]
-            ctx, session_id="sess-5", tool_name="get_weather"
+            ctx, session_id="sess-5", tool_name="get_weather", server_id="server-1"
         )
         result = await retrieve_context(ctx, session_id="sess-5")  # type: ignore[arg-type]
         assert result["mode"] == "metadata"
