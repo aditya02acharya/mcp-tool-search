@@ -1,5 +1,6 @@
-"""Background sync worker – polls upstream registry, diffs via two-tier
-content hashing, and incrementally re-embeds changed tools with TDWA.
+"""Background sync worker – polls remote MCP servers via the client factory,
+diffs via two-tier content hashing, and incrementally re-embeds changed tools
+with TDWA.
 
 Change detection
 ----------------
@@ -11,34 +12,55 @@ Change detection
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 
 import litellm
+from mcp.types import Tool
 
 from mcp_tool_router.embeddings.client import EmbeddingClient
 from mcp_tool_router.index.store import ToolIndex
+from mcp_tool_router.mcp_client.factory import MCPClientFactory
 from mcp_tool_router.models.schemas import IndexedTool, ToolRecord
-from mcp_tool_router.registry.client import RegistryClient
 from mcp_tool_router.settings import LLMSettings, RegistrySettings, TDWASettings
 
 logger = logging.getLogger(__name__)
 
 
+def _mcp_tool_to_record(server_id: str, tool: Tool) -> ToolRecord:
+    """Convert an ``mcp.types.Tool`` to a ``ToolRecord``."""
+    return ToolRecord(
+        name=tool.name,
+        description=tool.description or "",
+        server_id=server_id,
+        input_schema=tool.inputSchema if tool.inputSchema else {},
+    )
+
+
+def compute_global_hash(tools: list[ToolRecord]) -> str:
+    """SHA-256 of the entire sorted, serialised tool list (quick equality check)."""
+    payload = json.dumps(
+        [t.model_dump(by_alias=True) for t in sorted(tools, key=lambda t: t.name)],
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 class SyncWorker:
-    """Polls the upstream registry and keeps the local index in sync."""
+    """Polls remote MCP servers and keeps the local index in sync."""
 
     def __init__(
         self,
         *,
-        registry: RegistryClient,
+        mcp_client: MCPClientFactory,
         index: ToolIndex,
         embeddings: EmbeddingClient,
         registry_settings: RegistrySettings,
         tdwa_settings: TDWASettings,
         llm_settings: LLMSettings,
     ) -> None:
-        self._registry = registry
+        self._mcp_client = mcp_client
         self._index = index
         self._embeddings = embeddings
         self._reg_settings = registry_settings
@@ -69,8 +91,14 @@ class SyncWorker:
 
     async def sync_once(self) -> None:
         """Execute a single sync cycle."""
-        tools = await self._registry.list_tools()
-        global_hash = RegistryClient.compute_global_hash(tools)
+        all_server_tools = await self._mcp_client.list_all_tools()
+
+        tools: list[ToolRecord] = []
+        for server_id, mcp_tools in all_server_tools.items():
+            for mcp_tool in mcp_tools:
+                tools.append(_mcp_tool_to_record(server_id, mcp_tool))
+
+        global_hash = compute_global_hash(tools)
 
         if global_hash == self._last_global_hash:
             logger.debug("No changes (global hash match)")
@@ -121,6 +149,7 @@ class SyncWorker:
             IndexedTool(
                 name=tool.name,
                 description=tool.description,
+                server_id=tool.server_id,
                 input_schema=tool.input_schema,
                 output_schema=tool.output_schema,
                 tags=tool.tags,
