@@ -32,9 +32,9 @@ from mcp_tool_router.settings import MCPClientSettings, RegistrySettings
 logger = logging.getLogger(__name__)
 
 # Maximum allowed length for a single tool argument value (bytes).
-_MAX_ARG_VALUE_LEN = 1_000_000
+_MAX_ARG_VALUE_LEN = 200_000
 # Maximum allowed response content length (chars) before truncation.
-_MAX_RESPONSE_LEN = 5_000_000
+_MAX_RESPONSE_LEN = 1_000_000
 
 # HTTP status codes that trigger an auth retry.
 _AUTH_FAILURE_CODES = {401, 403}
@@ -82,6 +82,8 @@ class MCPClientFactory:
         self._pool_max_size: int = mcp_settings.pool_max_size
         # Guards pool mutations so concurrent callers don't race on eviction.
         self._pool_lock: asyncio.Lock = asyncio.Lock()
+        # Track background eviction tasks to avoid fire-and-forget leaks.
+        self._eviction_tasks: set[asyncio.Task[None]] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -144,6 +146,10 @@ class MCPClientFactory:
 
     async def close(self) -> None:
         """Disconnect all clients and release resources."""
+        # Wait for any in-flight eviction tasks
+        if self._eviction_tasks:
+            await asyncio.gather(*self._eviction_tasks, return_exceptions=True)
+            self._eviction_tasks.clear()
         # Close all pooled clients in parallel
         if self._clients:
             await asyncio.gather(
@@ -296,8 +302,9 @@ class MCPClientFactory:
                 while len(self._clients) >= self._pool_max_size:
                     evict_sid, evict_client = self._clients.popitem(last=False)
                     logger.info("Evicting LRU client for server %s", evict_sid)
-                    # Schedule close outside the lock to avoid holding it during I/O
-                    _bg = asyncio.ensure_future(self._safe_close_client(evict_client))  # noqa: RUF006
+                    task = asyncio.create_task(self._safe_close_client(evict_client))
+                    self._eviction_tasks.add(task)
+                    task.add_done_callback(self._eviction_tasks.discard)
 
                 self._clients[server.server_id] = ctx
 
